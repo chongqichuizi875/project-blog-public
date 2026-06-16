@@ -1,0 +1,58 @@
+---
+/**
+ * V2 状态价值矩阵 V(s)（§6.2）
+ * 状态 = Oracle（正确/错误）× Perception（未验证/通过/不通过/输出）
+ * 颜色按价值高低做热力：绿=高、灰=中、红=负。
+ */
+const cols = ['未验证', '通过', '不通过', '输出'];
+// [oracle][perception] = value
+const rows = [
+  { label: '✅ 正确', cls: 'ok', vals: [1, 1.5, 0.5, 2] },
+  { label: '❌ 错误', cls: 'bad', vals: [0, -0.5, 0.1, -1] },
+];
+// 颜色：把 [-1, 2] 映射到红→绿
+function cellStyle(v: number) {
+  // 归一化到 0..1
+  const t = (v + 1) / 3;
+  // 负值偏红，正值偏绿，0 附近灰
+  let bg: string;
+  if (v > 0) {
+    const a = Math.min(1, v / 2); // 0..1
+    bg = `rgba(47, 158, 68, ${0.12 + a * 0.5})`;
+  } else if (v < 0) {
+    const a = Math.min(1, -v / 1);
+    bg = `rgba(207, 34, 46, ${0.12 + a * 0.5})`;
+  } else {
+    bg = 'var(--bg-soft)';
+  }
+  return `background:${bg}`;
+}
+---
+
+<div class="svmatrix">
+  <div class="sv-title">状态价值 V(s)：controller 想把解题推向「正确·输出」（最高分 2），远离「错误·输出」（最低 −1）</div>
+  <div class="sv-scroll">
+    <table class="sv">
+      <thead>
+        <tr>
+          <th class="corner">Oracle ＼ 模型认知</th>
+          {cols.map((c) => <th>{c}</th>)}
+        </tr>
+      </thead>
+      <tbody>
+        {rows.map((r) => (
+          <tr>
+            <th class={`rowh ${r.cls}`}>{r.label}</th>
+            {r.vals.map((v) => (
+              <td style={cellStyle(v)}>{v}</td>
+            ))}
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  </div>
+  <p class="sv-note">
+    起点状态「无答案」V = 0。每个动作的 reward = <code>V(可达的最佳状态) − V(当前状态)</code>；非法动作（重复 / 不合逻辑）直接 −1。
+    例：在「正确·未验证」(V=1) 调 verifier，最好可达「正确·通过」(V=1.5) → reward = 1.5 − 1 = <b>0.5</b>。
+  </p>
+</div>

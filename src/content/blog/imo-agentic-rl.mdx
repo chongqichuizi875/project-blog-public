@@ -1,0 +1,600 @@
+---
+title: "From Fixed Agentic Workflow to Learnable Pipeline"
+subtitle: "一次成功的 Agentic RL 探索与学习，一份不完整的 research 工作"
+description: "把 UCLA 的固定多 agent 解题流程改造成端到端可强化学习的 pipeline：在同口径下达到高于固定 pipeline 的 pass@1，也踩了不少 agentic RL 的坑。一份带着复盘视角的探索笔记。"
+pubDate: 2026-01-18
+dateRange: "25.10 – 25.12"
+tags: ["Agentic RL", "LLM", "Reinforcement Learning", "复盘"]
+---
+
+import WorkflowDiagram from '../../components/WorkflowDiagram.astro';
+import PerQuestionTable from '../../components/PerQuestionTable.astro';
+import StateValueMatrix from '../../components/StateValueMatrix.astro';
+import StateActionMatrix from '../../components/StateActionMatrix.astro';
+
+> **写在前面（本文的定位）**：把这个项目如实定位为两部分——
+> - **一次完整的 agentic RL 工程实践**：跑通了"把一套固定多 agent workflow 改造成端到端可训练 RL pipeline"的全流程，在同口径下达到高于固定 pipeline 的 pass@1，过程中也遇到并处理了 agentic RL 的若干典型问题（稀疏奖励、训练崩溃、压缩有损、prompt 形态错配等）。
+> - **一份未完成充分验证的工作**：没有做系统的消融来归因"这个可训 workflow 的提升来自哪里"——并行结构、reward 设计，还是 base 模型本身。因此结论停留在"它能 work"，而非"它为何 work"。相关分析见 §8。
+>
+> 因此下文按复盘视角组织：方法演进的脉络、每一步的定量信号，以及结论的成立边界。
+
+<a class="reflect-callout" href="#sec-reflection">
+  <span class="rc-icon">★</span>
+  <span class="rc-body">
+    <span class="rc-title">如果只读一节，请读 §8 · 复盘</span>
+    <span class="rc-desc">关于这个工作成在哪、为什么难、若要做成该往哪走，以及我为什么没有发表它——这是我个人认为最重要的部分。</span>
+  </span>
+  <span class="rc-arrow">→</span>
+</a>
+
+---
+
+## 摘要（TL;DR）
+
+Google 的 **Gemini 2.5 Pro** 借助一套被称为 **UCLA pipeline** 的多智能体解题流程，在 IMO 级别题目上达到了**金牌水平**。但这套 pipeline 是**推理时人手拼出来的固定流程**——流程不可训练，模型本身不会因此变强。
+
+**本项目要回答：能否把这套固定的多 agent 解题流程，改造成端到端可强化学习训练的系统？**
+
+我们的方案是一个**全流程可训（fully-trainable）pipeline**：
+
+- **一个 Controller（总控）** 负责编排，**每一次 tool call 就是一个 sub-agent**（solver / verifier / refiner）；
+- **所有角色共享同一份模型权重**（controller 与各 tool 是同一个 model instance）；
+- 一条完整解题是一条 **multi-turn trajectory**，其中 controller 与 tool 产生的**所有样本一起参与 RL 训练**。
+
+**核心结论（定量，同口径 qwen3-4b @ 16k）**：在**不引入任何外部工具信息**（纯文本、所有 sub-agent 都是模型自身）的前提下，训练出的可训 pipeline **把 pass@1 从 54.29 训到 66.98（未收敛），在同口径下高于固定 UCLA pipeline 与官方纯文本**：
+
+| qwen3-4b（AIME25 pass@1，均 16k 量级） | 平均调用轮数 | pass@1 |
+|---|---|---|
+| 纯文本 16k | 0 | 36.25 |
+| 纯文本 38k（官方 Qwen3-4B） | 0 | 65.6 |
+| **UCLA 固定 pipeline（16k）** | 12.7 | 59.4 |
+| **本项目可训 workflow（16k）** | **-** | **54.29 → 66.98（未收敛）** |
+
+> **成果**：在同口径下，可训 pipeline 达到了高于固定 UCLA pipeline 的 pass@1。
+> **保留**：该提升的归因与稳健性尚未通过消融厘清——详见 §8。
+
+---
+
+# 第一部分 · 主线
+
+> 主线按项目实际推进顺序展开，每个阶段开头给出 **【核心改动】** 与 **【定量效果】**。从主线岔出的探索性工作收入[第二部分 · 探索旁支](#第二部分--探索旁支)，在主线相应处以"→ 见旁支 X"引出。
+
+## 1. 背景、目标与系统设计
+
+UCLA pipeline 的本质是"**生成 → 验证 → 修正**"的固定循环（solver → self-improvement → verifier → bug-report-reviewer → corrector → verifier → …），用大量推理换严谨性，但**流程写死、不可训练**。
+
+> **目标**：把"人写死的 IMO 解题流程"升级为"可被 RL 优化的 agentic 策略"——模型不仅会用，还能在使用中通过 RL 真正变强。
+
+**系统设计**：Controller 不直接解题，只做"策略性编排"；每个角色 = 一次 tool call：
+
+| 角色 | 作用 |
+|---|---|
+| **solver** | 生成初稿解答 |
+| **self-improvement** | 即时自我改进 |
+| **verifier** | 以 IMO 评分员视角严格验证，产出 bug report |
+| **bug-report-reviewer** | 过滤 verifier 过苛意见 |
+| **corrector** | 按 bug report 修正 |
+
+**架构上的核心追求——"全流程可训"**。训练方案本身也经历了演进，最终目标是让整条 pipeline 端到端可训：
+
+| 训练方案 | tool 如何提供 | 训练谁 |
+|---|---|---|
+| 一期 | tool = 冻结的 vllm api | 只训 controller |
+| 共享权重 | **controller 与 tool 共享权重** | 只训 controller 样本 |
+| **全流程可训（终态）** | **controller 与 tool 共享权重** | **controller + tool 生成的所有样本一起训** |
+
+> 同一条 trajectory 中的多个 tool 样本，**共享其所在 trajectory 的 controller advantage**——这样整条解题轨迹被作为一个整体来优化。
+
+---
+
+<span id="sec-baseline"></span>
+
+## 2. Baseline
+
+> 动手前，先用数据钉死"纯文本能到哪、固定 pipeline 贵在哪"。以 **qwen3-4b**（AIME25 pass@1）为例：
+
+| 方法 | 平均调用轮数 | pass@1 |
+|---|---|---|
+| 纯文本 16k | 0 | 36.25 |
+| 纯文本 32k（官方，38k 上限） | 0 | 65.6 |
+| **UCLA 固定 pipeline 16k** | 12.7 | 59.4 |
+
+**关键事实**：UCLA 固定 pipeline 靠 **12.7 轮**调用，把 16k 纯文本的 pass@1 从 36.25 抬到 59.4——**但代价是十余轮的反复采样/验证**（这套固定流程的结构见 **[附录图 B.0 →](#fig-b0)**）。
+
+> **命题**：要训练的 controller，价值**不在"多调工具"**（那只是更贵），而在于**用尽量少、恰到好处的调用，超过固定 pipeline**。
+
+---
+
+<span id="sec-summary"></span>
+
+## 3. 第一阶段：summary 压缩 workflow + SFT 冷启动 —— 此路不通
+
+> 📐 本阶段 workflow 的结构与 reward / advantage，见 **[附录图 B.1 →](#fig-b1)**。
+
+> **【核心改动】** 为追求"可无限扩展"的解题流程（轮数不受上下文限制），设计**每轮增量 summary 压缩**：第 k 轮只依赖 *初始 prompt + 题目 + 第 k-1 轮 summary + 第 k-1 轮 sub-agent 返回文本*；模型每发起一次 tool call，就紧接着把"上一轮 tool response + 本轮 tool call"增量更新进 summary。
+> 这个"tool call + summary 维护"的复合任务，起点模型 `qwen3-8B` 试遍 prompt 都做不好指令遵循 → 因此引入 **SFT 冷启动**，让 8B 跨过这个复合协议的格式门槛（SFT 是**协议适配**，不是教解题）。
+
+> **【定量效果】** 压缩严重掉点，方案被否（**A3B-thinking-2507，32k，AIME25 pass@1**）：
+>
+> | 方案 | 平均轮数 | pass@1 |
+> |---|---|---|
+> | 不压缩 | 20.25 | **90.83** |
+> | summary block 压缩 | 10 | **53** |
+> | memory agent 压缩 | 7 | **40** |
+>
+> 压缩把 pass@1 从 **90.83 砸到 40–53**。结论：**summary 压缩这条路走不通**。
+
+→ 我们曾试图救活 summary（剥离成独立总结 agent 等），均失败，详见 [旁支 A](#旁支-a救活-summary-的尝试)。
+
+---
+
+## 4. 关键转向：弃压缩 → full context + 回到 zero-start
+
+> **【核心改动】** 既然 summary 救不活，就**放弃压缩、改用 full context**（模型直接看到全部历史）。但 full context 要装下完整轨迹，8B 仅 40960 上下文撑不住 → **换上长上下文模型（Qwen3-2507 系列，原生 256k）**。
+> 换 base 还顺带解掉了 SFT 的历史包袱：summary 没了、base 格式遵循也更强，原 SFT 过的 8B 起点**双重失效** → **回到 zero-start（直接从 base 做 RL，不再 SFT）**。
+
+至此主线训练起点定型：**full context + 长上下文 base + zero-start + 全流程可训**。
+
+---
+
+## 5. 自规划 workflow 的起点问题：比纯文本还差，且训不上去
+
+> **【核心改动】** 不再走 UCLA 的固定流程，让 **controller 自主决定是否/何时调用工具**（自规划 workflow）。
+
+> **【定量效果】** 自规划 workflow 的**起点（step0）就比纯文本差**（4b-thinking-2507，AIME25 pass@1）：
+>
+> | 方法 | pass@1（step0） |
+> |---|---|
+> | 纯文本 32k | **73.67** |
+> | 自规划 workflow（已有版本，episode-level advantage） | **~66.5** |
+>
+> 起点已经落后约 7 分，**而且训不上去**：tool call 次数上不去、训练指标抖动、val 不涨。
+
+**为什么起点（step0）就更差？** 这与训练、奖励无关（根本还没训）。原因是：**step0 时调用 tool 的比例很低，绝大多数题是 controller 直接解题；而这些直接解题走的是 controller 的 prompt（要求它做编排/判断），解题能力不如默认的解题 prompt** —— 于是落后了纯文本几分。
+> 但要强调：**这个 gap 相比压缩版本的暴跌（§3：90.83 → 40–53）是完全可以接受的**——它只是 prompt 形态带来的小幅差异，不是能力损失，后续可通过训练弥补。（这一机制在最终 V4 的逐题分析中被进一步定量印证，见 §6.4。）
+
+> **接下来的主线，就是一场"如何让这个 workflow 训得上去"的连续攻坚**——我们怀疑根因是**奖励信号稀疏，模型探索不到密集有效奖励**，于是沿着 reward 与 workflow 结构连续迭代了 V1→V4（§6）。
+
+---
+
+## 6. 连续迭代 V1→V4：直到"并行 workflow"才真正训上去
+
+> 核心线索：**前三版（V1/V2/V3）尝试了多种 reward 与状态设计，都没能把 4b-thinking-2507 训上去；直到 V4 引入"并行 solver"才出现可训迹象，并顺势切换到 qwen3-4b。**（V4 结构总览见 [图 B.5](#fig-v4)）
+
+<span id="sec-v1"></span>
+
+### 6.1 V1：episode-level → trajectory-level reward（仍训不上去）
+
+> 📐 结构与 reward / advantage 见 **[附录图 B.2 →](#fig-b2)**。
+
+> **【核心改动】** 把 reward/advantage 从 episode 级改为 **trajectory 级**：用 rule-based 判定每条 trajectory 的对错（tool 答对 1 / 答错 0 / format error −1；verifier、bug-report-reviewer 各自按"判断是否与真值一致"算对），每条 trajectory 在自己的 group 内算 advantage。
+
+> **【结果】** tool call 次数仍上不去、指标抖动，**没有训上去**。
+
+<span id="sec-v2"></span>
+
+### 6.2 V2：程序化维护状态 + 状态转移过程 reward（仍训不上去）
+
+> 📐 结构、状态机与两种 group 划分见 **[附录图 B.3 →](#fig-b3)**。
+
+> **【核心改动 1：程序化维护状态——controller 只给 hint，不再抄写】**
+> 这是 V2 与 V1 的本质区别。V1 里 controller 每轮都要把**完整的题目、当前解答、bug 报告原样抄写**进 tool 的输入；V2 改由**一个程序状态机**托管这些内容，controller 调用 tool 时**只输出一句增量 hint**，由程序自动把"状态 + hint"拼好喂给 tool。
+
+> 举个例子，让 controller 调 solver 修正解答：
+> - **V1（抄写）**——controller 要自己输出一大段：
+>   > 「题目：*[完整题面…]*。当前解答：*[整篇 solution 全文…]*。bug 报告：*[verifier 的完整意见…]*。请据此修正。」
+> - **V2（只给 hint）**——题目 / solution / bug-report 都由程序托管，controller 只需输出：
+>   > 「调用 solver，hint：**第 3 步的边界条件 n=0 没讨论**」
+>
+>   程序随后自动拼成 `[程序托管的题目 + 当前 solution + bug-report] + controller 的这句 hint` 一起喂给 solver。
+> 好处：controller 的输出短得多（16k 足够），它只需聚焦"该提示什么"，不被冗长抄写干扰。混合长度训练（controller 16k、tool 32k）。
+
+> **【核心改动 2：状态转移过程 reward】**
+> 不再只看最终对错，而是给**过程**打分。定义状态 = **Oracle**（上帝视角：当前解答是否真解对）× **Perception**（模型自认知：未验证 / 通过 / 不通过 / 输出），每个状态赋一个价值 $V(s)$（例：$(\text{正确},\text{输出})=2$、$(\text{错误},\text{输出})=-1$、$(\text{错误},\text{不通过})=0.1$）。controller 每个动作的 reward：
+> $$r = V(s'_{\text{best}}) - V(s)$$
+> 即"当前状态经一个合法 action 后**理论可达的最佳状态分** − 当前状态分"；非法 action（重复 / 不合逻辑）直接 −1。**用意是剥离 tool 返回质量的噪声**——controller 调用了正确的 tool，但 tool 偶然返回差结果，不该怪 controller。
+> advantage 聚合：tool 按"同题同角色 (problem_id, role)"、controller 按"同题同状态"成组。
+
+<StateValueMatrix />
+
+<StateActionMatrix />
+
+> **【结果】仍训不上去**：训练 rollout 正确率没提升、**val 基本不涨**；controller reward 能学会、但 tool reward 基本不变；4b-thinking-2507 还出现 **entropy 越训越低、episode/response length 越训越短**（跑久了会 hang、效率低，期间一度切到 qwen3-4b 验证）。
+> 一个有用的副产物：log 显示模型在"oracle 错误"状态下反复刷 verifier（verifier 恰好答对、但 solution 是错的），于是把 (错误, 不通过) 状态价值从 0.5 下调到 0.1。
+
+<span id="sec-v3"></span>
+
+### 6.3 V3：删除 prompt 结构性引导 + reward 简化为规则抓（过拟合，仍未突破）
+
+> 📐 流程结构同 V2，但 reward 改为规则抓，见 **[附录图 B.4 →](#fig-b4)**。
+
+> **【核心改动】** 在 V2 的程序化状态机之上，再做两件事：
+> 1. **彻底删掉 prompt 的结构性引导**——不再用 prompt 提示 controller "该按什么套路编排"，状态完全交给程序维护，让模型自己学策略；
+> 2. **reward 从"状态转移过程 reward"简化为"规则抓（rule-based）"**——不再算 $V(s'_{\text{best}}) - V(s)$，而是直接用规则判每条 trajectory 的对错：solver 抓 $\boxed{\cdot}$ 答案对 GT、verifier 抓 $\boxed{\texttt{Right/Wrong}}$ 与真值是否一致、bug-report-reviewer 抓 $\boxed{\texttt{Agree/Disagree}}$；对 / 错 → 1 / 0，format error → −1。
+
+> **【结果】** 初始 pass@1 反而更低（原因待查）；pass@32 以上与上一版几乎无区别、但仍低于 UCLA 上限；并出现明显**过拟合**（rollout 训练集 pass@k 涨、val pass@k 不涨）→ 仍未突破。
+
+<span id="sec-v4"></span>
+
+### 6.4 V4：削减角色 + 引入并行 —— 终于训上去
+
+> 📐 本节的 workflow 结构、reward 与 advantage / group 划分，见 **[附录图 B.5：V4 可训并行 workflow 一图看全 →](#fig-v4)**。
+
+> **【核心改动】** 一次大幅简化与重构：
+> 1. **角色合并**：solver / self-improvement / corrector → **单一 solver**（靠 controller 给的 hint 在串行中制造 context 差异）；
+> 2. **verifier / bug-report-reviewer 并入 controller**，controller 新定位 = **(调用、筛选、判断)**；
+> 3. **引入并行**：一轮**并行调用多个 solver**，结果拼回 context；controller 筛选→有正确答案则输出、否则带经验 hint 继续并行调用（[流程与 reward 见图 B.5](#fig-v4)）。
+> 4. **reward**：controller 输出轮/solver 答对 1、答错 0、format error −1；controller 调用轮——调用前一轮已有 potential right answer 却仍调用→判断错误给 0，否则给 1。
+
+> **【为什么 V4 能用 qwen3-4b（而非 2507）】** 并行 workflow 把多个 solver 的结果拼回时**不包含各 solver 的 think 部分**，因此上下文不会很长——这使得**用 16k 的 qwen3-4b 也能承载**。而此前 4b-thinking-2507 一直训不动（hang、entropy 降、长度缩），**V4 之后我们顺势切换到 qwen3-4b 训练，不再依赖 2507**。
+
+> **【结果】这是第一个真正"训上去"的版本**——定量结果见 §7。
+
+### 6.5 V4 行为剖析：用 4b-thinking-2507 在 AIME25 上的逐题分析
+
+> 在切到 qwen3-4b 正式训练前，我们先用 **4b-thinking-2507（32k，workflow v4，step0 未训练）** 在 **AIME25 全 30 题、avg256** 上做了一次细致的逐题剖析，回答三个问题：**① 为什么 workflow 在 step0 整体表现更差？② 在真的遵守指令做了 tool call 的情况下，是否更好？③ 它在什么情况下更倾向于调用 tool？**
+
+**整体数字（AIME25 全 30 题，avg256）：**
+- workflow v4 **总调用 tool 比例仅 5.62%**——即 **94.38% 的题是 controller 直接解题**；
+- **直接解题部分 avg acc = 67.25**（显著低于纯文本各 prompt）；
+- 调用 tool 部分 avg acc = 96.06（**不具参考意义**——正确率低的题几乎不触发 tool call，是幸存者偏差）。
+
+**① 为什么整体更差？同一套 workflow，换不同 prompt 直接解题，分数差一截：**
+
+| 直接解题所用 prompt（4b-thinking-2507 32k） | AIME25 avg256 均分 |
+|---|---|
+| 纯文本 · Retool prompt（"Please solve the problem step by step ..."） | **73.95** |
+| 纯文本 · Solver prompt | 72.23 |
+| **workflow v4（走 controller 编排 prompt）** | **68.87** |
+
+> 同样是直接解题，只因为走的是 **controller 的编排/判断 prompt** 而非模型熟悉的解题 prompt，均分就从 73.95 掉到 68.87。**掉分来自 prompt 形态，不是能力损失**——这也解释了为什么 workflow 在 step0 整体更差（94.38% 的题都在用这个"掉分"的 prompt 直接解题）。
+
+**② / ③ controller 在什么题上调用 tool？调用了有没有用？逐题看一眼：**
+
+下表选取 AIME25 里**最有代表性的题**：上半是 controller **实际调用了 tool** 的题，下半是几道**典型难题**（直接解题 avg &lt; 90）。颜色规则：🟧 = 难题却几乎不调用、自己硬解；🟢 = 难题且调用 tool 后**分数被拉上来**（↑ 标记）；灰 = 已答好无需调用。
+
+<PerQuestionTable
+  data={[
+    { q: 4,  direct: 100,   ratio: 0.8984, tool: 99.57 },
+    { q: 17, direct: 100,   ratio: 0.2891, tool: 100 },
+    { q: 16, direct: 100,   ratio: 0.0742, tool: 100 },
+    { q: 1,  direct: 100,   ratio: 0.0781, tool: 95 },
+    { q: 18, direct: 57.73, ratio: 0.1406, tool: 88.89 },
+    { q: 25, direct: 67.72, ratio: 0.0078, tool: 100 },
+    { q: 28, direct: 23.89, ratio: 0.0352, tool: 33.33 },
+    { q: 10, direct: 9.77,  ratio: 0,      tool: null },
+    { q: 11, direct: 57.03, ratio: 0,      tool: null },
+    { q: 20, direct: 17.97, ratio: 0,      tool: null },
+    { q: 7,  direct: 50.39, ratio: 0,      tool: null },
+    { q: 9,  direct: 82.42, ratio: 0,      tool: null },
+  ]}
+/>
+
+> **错配看得很清楚**：controller 调用最多的几道题（Q4 调 89.8%、Q17 调 28.9%、Q16/Q1…）**几乎都是它本来就能拿满分的题**；而真正的难题（Q10=9.77、Q20=17.97、Q7=50.39、Q11=57.03…）它**基本不调用、自己硬解**（🟧）。
+> 但**一旦在难题上真的调用了（Q18 57.7→88.9、Q25 67.7→100、Q28 23.9→33.3）**，tool call 都把分数往上拉（🟢 ↑）。**这正是 RL 的机会点**：让 controller 学会在该求助的难题上主动调用。
+
+**④ controller 的"筛选判断"是有价值的**：对 tool call 样本，若用多个 solver 的 **majority voting** 替换 controller 筛选出的答案，分数 **≤ workflow**——说明 controller 学到的不是无脑多数投票，而是有效筛选。
+
+> 这次剖析厘清了"workflow 起点为何更差"（prompt 形态 + 调用错配，而非能力下降），也指出了 RL 的可能着力方向：**让 controller 学会在自己答不出的难题上主动调用、并筛选 sub-agent 的结果。**
+
+---
+
+## 7. 最终结果：可训 pipeline 超过固定 UCLA pipeline
+
+> **【最终定量结果】** 用 **V4 + qwen3-4b（16k）** 训练（[V4 结构见图 B.5](#fig-v4)），AIME25 pass@1：
+
+| 方法（均 16k 量级） | 平均调用轮数 | pass@1 |
+|---|---|---|
+| 纯文本 16k | 0 | 36.25 |
+| 纯文本 38k（官方 Qwen3-4B） | 0 | 65.6 |
+| UCLA 固定 pipeline（16k） | 12.7 | 59.4 |
+| **本项目可训 workflow（V4, 16k）** | — | **54.29 → 66.98（240 step，未收敛）** |
+
+- 从 **起点 54.29 训练到 240 step 的 66.98**（**+12.7 分**），**超过 Qwen3 技术报告 4B 的 65.6** 且仍未收敛（因物理机存储满训练中断，已保存 240/250 checkpoint 待续训）。
+- **关键对比**：16k 同口径下，可训 workflow 的 pass@1（66.98）**高于 UCLA 固定 pipeline（59.4）**，也高于纯文本 38k（65.6）。
+
+> **【小结】** 在 16k 同口径下，可训 workflow（共享权重、所有样本一起训）的 pass@1 达到 66.98，高于 UCLA 固定 pipeline（59.4）与纯文本 38k（65.6）。就该口径的数据而言，把固定 pipeline 改造为可训练系统是可行的；但这一结果的归因与稳健性存在保留，详见 §8。
+
+---
+
+<span id="sec-reflection"></span>
+
+## 8. 复盘：成在哪、败在哪，以及为什么没有发表
+
+> 这一节是对工作本身的分析与判断，包含成立性、失败原因、可行的改进方向，以及不发表的理由。
+
+### 8.1 "成功"的结果并不 solid
+
+54.29 → 66.98 这条曲线，归因上需要谨慎。**提升更可能来自一个朴素的机制，而非 workflow 学到了本质的解题策略**：16k 的单轮上下文对 thinking 模型偏紧，训练较容易做到的，是**减少 overlong（超长、截断）样本**——overlong 减少会间接抬高分数。
+
+一个反向证据是：在更长的上下文下训练（4b-thinking-2507 训 32k），"减少 overlong"的空间被压缩后，**没有观察到合理的提升**。这说明该提升很可能依赖"16k 对 thinking 模型偏紧"这一特定配置，而非方法本身。**一个随上下文长度变化就消失的提升，可靠性有限。**
+
+### 8.2 失败原因：当前范式下这条路本就难走通
+
+更一般地说：**在"当前 RL 训练范式 + 现有基础模型"的组合下，让一个不依赖外部工具的 multi-agent 系统解数学题，难度本就很高。**
+
+这里有一个常被忽略的原因，和**任务在后训练中所处的拟合状态**有关。"直接解数学题"这件事，在现代模型的后训练阶段（尤其各类 reasoning RL）已经被**反复、充分地优化过**——模型在这一能力上基本处于收敛得很好、表现已经很强的区间。在一个已经接近饱和的能力上，再叠一层 multi-agent 编排去做 RL，可撬动的边际空间天然有限：底层 solver 本身已经很强，编排带来的增量容易被它的高基线"吃掉"。
+
+相比之下，像 **search、工具调用编排**这类 agentic 场景，更依赖指令遵循与对环境/中间结果的理解，而这些能力在后训练中的**暴露并不充分**——模型已经具备相关指令遵循的基础，但整体仍处于**欠拟合**的阶段。正是在这种"有基础、但远未拟合"的区间里，RL 才有较大的提升空间。**也就是说，数学解题或许恰恰是 agentic RL 较难体现价值的任务类型之一**——不是方法不行，而是这块能力的基线太高、留给编排策略学习的余量太小。
+
+可行的路径大多是重资源的：要么**用充分的 SFT 注入 task-specific 能力**，要么**分阶段训练**（如 VisionCreator-R1、deepseek-math-v3.2 的思路）——先得到一个**可靠的 verifier**，再据此训练出**更好的 solver**。缺少这一地基，仅靠 RL 在 plain-text 上自举 multi-agent 解题系统，较难取得实质效果。
+
+> **对一类相关工作的看法。** 该方向有一些覆盖数学任务的工作（如 Dr.MAS 2603）。但其中部分结果的可信度存疑：Table 1 的分数偏低，所报告的"训练提升"有时是在**不合理的 response length 配置下取得的**——较短的 response length 会压制模型本身的长链推理能力，再与一个被削弱的基线对比，提升便随之出现。类似的情况还有：使用内部 SFT 数据获得提升、但将贡献归于 RL；或最终结果**不及直接增大 response length**，却仍声称相对 baseline 算法有提升。
+>
+> 这类工作不符合我的判断标准。**我倾向于不产出此类结果**——既出于对读者负责，也出于对给我机会做这件事的老师负责。
+
+### 8.3 若要真正做成，可能的方向
+
+回到命题本身：
+
+- **分步骤解题 + 中间过程校验。** 难题解不出，部分原因是"一次性输出"的能力存在上限；将问题拆解、每步及时校验中间过程，**把"一次跨一层"改为"逐级推进"**，理论上可行——它能**抬高相同能力模型的搜索空间上限**。
+- **主要瓶颈在"中间过程的精准打分"，代价较高。** 实现方式有两类：用**大模型作 reward server** 逐步判定对错；或用**高质量 SFT** 让模型学会用**代码进行形式化证明校验**，即把"plain-text 解数学"重构为 **reasoning + coding** 问题。两者成本都不低，但难以绕开。
+
+### 8.4 工程上值得做消融的点
+
+若目标是把 agentic system 的能力推到极致，以下几点在后训练中值得系统性地做消融，而非凭直觉设定：
+
+- **reward assignment**：按状态转移分配 reward（更合理的信用分配），而非只看最终对错；
+- **不同角色分 group**：不同类型 trajectory 的方差差异较大，分组计算 advantage 影响显著；
+- **训练信号的混合比例**：不同角色样本在一个 train batch 中的占比，决定训练信号的构成。
+
+这几项在项目中均有涉及、并凭经验调整过，但**受限于时间和资源，未能做到干净的受控消融**——而它们恰恰决定这类系统的能力上限。
+
+### 8.5 为什么没有整理发表
+
+**agentic RL 训练对配置较为敏感**：不少结论随上下文长度变化会明显减弱甚至消失（见 §8.1）。
+
+需要说明的是，**在更弱的 baseline 上用公平方式取得提升，本身也能体现算法的一定优越性**，据此整理成一篇可发表的论文并不困难。但本工作的目标是**取得能真正抬高上限的结果**。由于尚未达到这一标准，我选择**不整理、不发表**，而是将其如实写成这篇复盘。
+
+---
+
+# 第二部分 · 探索旁支
+
+## 旁支 A：救活 summary 的尝试
+
+> **从哪开始**：§3，summary 压缩严重掉点之后。
+> **目的**：summary 的"无限扩展"太诱人，希望救活它而非直接放弃。
+> **做法与结论**：① 反复打磨 summary 的 prompt 与格式；② 把 summary 从 controller 剥离、做成与 tool call **并行的独立总结 agent**。**两者均无效**。更本质地，压缩这条路又贵又有损：窗口耗尽前每轮 decode 更新 memory 非常昂贵（decode 远慢于 prefill）、且累积信息损失（参考 Claude Code / Codex 也不频繁触发压缩）。**最终确认 summary 不可救 → 主线转向 full context（§4）。**
+
+## 旁支 B：训练稳定性（一句话）
+
+> **从哪开始**：贯穿整个 RL 训练。
+> **结论**：**少数异常/超长样本贡献了大量"超出 clip range 的 ppo ratio"，是训练崩溃的元凶**，需用 truncation + 合理 max steps 抑制。其余（advantage shaping、训练样本组成、padding 等）为工程细节，从略。
+
+## 旁支 C：课程式 tool-call 轮数限制
+
+> **从哪开始**：§5/§6 攻坚期，为缓解"动作空间太大、奖励太稀疏"。
+> **做法**：**硬限制每个 episode 的 tool call 总次数**，先在小空间学会有效行为，再逐步放开（先限 2 轮，拿好 checkpoint 再放到 3）——课程学习思路。
+> **结论**：限 2 轮训练可得到平均调用轮数很低的 checkpoint，是一条有用的稳定化手段；但**放开时机/幅度敏感**，过早过猛放开会导致冗余调用惩罚不足、搜索模式退步甚至训崩。它是 V4 突破前的辅助探索，未单独成为最终方案的决定性因素。
+
+---
+
+## 附录
+
+**A · 一条标准可训练轨迹**（来自 SFT 数据 demo）：换轮胎问题 → controller 调 solver → solver 给出 9375km → controller 调 verifier → verifier 逐步核验无误 → controller 输出 $\boxed{9375}$。
+
+**B · 各版本 workflow 流程图 + reward / advantage 设计**
+
+> **读图约定**：
+> - **一个框 = 一次 assistant 推理 = 一条训练样本**（该次推理输出的所有 token 都在同一个框里）。一张图从上到下就是**一次完整 rollout（一条 trajectory）**。
+> - 颜色：<span>🟦 controller</span>（蓝）、<span>🟩 tool/sub-agent</span>（绿）、⬜ 输入或环境返回（非模型生成、不计 loss）。
+> - 流程图用 Mermaid 绘制（Notion 插入代码块并选 Mermaid 语言即可渲染）。
+
+### B.0 UCLA 固定 pipeline（基线，不可训练）
+
+> 角色按人手写死的顺序流转，没有 controller、不训练。
+
+<WorkflowDiagram
+  id="fig-b0"
+  backLink={{ href: '#sec-baseline', label: '回到 §2 Baseline' }}
+  title="图 B.0 · UCLA 固定 pipeline（基线，无 reward / 不训练）"
+  caption="人手写死的固定循环：solver → self-improvement → verifier →（不通过则 bug-report-reviewer → corrector → 回 verifier）。<b>纯推理时 scaffolding，所有框都不计 loss、没有任何 reward / advantage。</b>"
+  legend={[
+    { color: '#868e96', label: '输入 / 输出（环境，不计 loss）' },
+    { color: '#2f9e44', label: 'tool / sub-agent（固定调用，不训练）' },
+  ]}
+  columns={[
+    { node: { role: '输入', note: 'prompt + 题目', kind: 'io' } },
+    { node: { role: 'solver', note: '出初稿', reward: '无', kind: 'tool' } },
+    { node: { role: 'self-improvement', note: '自我改进', reward: '无', kind: 'tool' } },
+    { node: { role: 'verifier', note: '验证，出 bug report', reward: '无', kind: 'tool' }, roundtag: '不通过 → reviewer/corrector 后回到此处（循环）' },
+    { node: { role: 'bug-report-reviewer', note: '过滤过苛意见', reward: '无', kind: 'tool' } },
+    { node: { role: 'corrector', note: '按 bug report 修正', reward: '无', kind: 'tool' } },
+    { node: { role: '输出答案', note: 'verifier 通过后', kind: 'io' } },
+  ]}
+  loopNote="固定循环，平均 ~12–20 轮调用。<b>reward / advantage：无</b>——这正是本项目要改造的对象：把不可训练的 scaffolding 变成可训练系统。"
+/>
+
+- **特点**：固定循环，平均 ~12–20 轮调用。**reward / advantage：无**（纯推理时 scaffolding）。
+
+### B.1 Summary 压缩版（§3）
+
+> 关键：controller **一次推理同时输出 [tool_call + 新 summary]**（所以是同一个框）。第 k 轮依赖 *初始 prompt + 题目 + 第 k-1 轮 summary + 第 k-1 轮 sub-agent 返回文本*。
+
+<WorkflowDiagram
+  id="fig-b1"
+  backLink={{ href: '#sec-summary', label: '回到 §3 Summary 压缩' }}
+  title="图 B.1 · Summary 压缩版"
+  caption="controller <b>一次推理同时输出 [tool_call + 新 summary]</b>（同一个框 = 一条样本）。第 k 轮看：初始 prompt + 题目 + 第 k-1 轮 summary + 第 k-1 轮 sub-agent 返回文本，靠增量压缩实现『轮数不受上下文限制』。"
+  legend={[
+    { color: '#868e96', label: '输入 / tool 返回（环境，不计 loss）' },
+    { color: '#1971c2', label: 'controller 样本（决策 + 维护 summary）' },
+  ]}
+  columns={[
+    { node: { role: '输入', note: '初始 prompt + 题目<br/>+ 第 k-1 轮 summary<br/>+ 第 k-1 轮 sub-agent 返回', kind: 'io' } },
+    {
+      node: { role: 'controller · 第 k 次推理', note: '① 读 summary 决策<br/>② 输出 tool_call<br/>③ 更新 summary = 旧 ⊕ 本轮调用 ⊕ 上轮返回', reward: 'episode 级（稀疏）', kind: 'ctrl' },
+      roundtag: '一条样本 = 决策 + 维护 summary',
+    },
+    { node: { role: 'sub-agent 返回', note: 'vllm api，非训练', kind: 'io' }, roundtag: '→ 下一轮带新 summary + 本轮返回回到 controller（循环）' },
+  ]}
+  adv={[
+    { kind: 'none', html: '<b>reward</b>：episode 级，仅最终答对 / 答错（稀疏）。&nbsp;&nbsp;<b>advantage</b>：last controller 在同一 problem 下算 episode-level advantage，<b>共享</b>给该 episode 的所有 trajectory。' },
+  ]}
+  loopNote="<b>结果</b>：压缩有损——A3B-thinking-2507（32k）上 pass@1 从 90.83 砸到 40–53。另复合任务（tool_call + 维护 summary）指令遵循难，qwen3-8B 需 SFT 冷启动才能跨过格式门槛。"
+/>
+
+- **reward**：episode 级，最终答对/答错（稀疏）。
+- **advantage**：last controller 在同一 problem 下算 **episode-level advantage**，共享给该 episode 的所有 trajectory。
+- **结果**：压缩有损——**A3B-thinking-2507（32k）pass@1 从 90.83 砸到 40–53**；复合任务（tool_call + 维护 summary）指令遵循难，qwen3-8B 需 SFT 冷启动才能遵守格式。
+
+### B.2 V1：trajectory-level reward（§6.1）
+
+> controller 与各 tool 交替推理，**每个框各是一条训练样本**。
+
+<WorkflowDiagram
+  id="fig-b2"
+  backLink={{ href: '#sec-v1', label: '回到 §6.1 V1' }}
+  title="图 B.2 · V1 trajectory-level reward"
+  caption="controller 与各 tool <b>反复交替推理</b>，每个框各是一条训练样本。<b>这是一个循环</b>——controller 看 tool 返回后再决策、再调用，直到它决定输出最终答案；下面只画出前两轮示意。每条 trajectory 在<b>自己的 group</b> 内算 advantage（trajectory-level）。"
+  loopArc="controller ↔ tool 反复交替，直到 controller 决定输出"
+  legend={[
+    { color: '#868e96', label: '输入（环境，不计 loss）' },
+    { color: '#1971c2', label: 'controller 样本' },
+    { color: '#2f9e44', label: 'tool 样本（solver / verifier / …）' },
+    { color: '#ae3ec9', label: 'controller 输出（终答）' },
+  ]}
+  columns={[
+    { node: { role: '输入', note: 'prompt + 题目', kind: 'io' } },
+    { node: { role: 'controller', note: '选角色，发 tool_call', reward: '随 trajectory', kind: 'ctrl' }, roundtag: 'round 1' },
+    {
+      node: { role: 'tool', note: 'solver / SI / verifier /<br/>reviewer / corrector 之一', reward: 'solver✓1/✗0；verifier、reviewer 判断与真值一致✓；fmt−1', kind: 'tool' },
+      roundtag: 'round 1',
+    },
+    { node: { role: 'controller', note: '看返回，再决策', reward: '随 trajectory', kind: 'ctrl' }, roundtag: 'round 2' },
+    {
+      node: { role: 'tool', note: '再调一个角色', reward: '同上', kind: 'tool' },
+      roundtag: 'round 2 … ↺ 继续循环',
+    },
+    { node: { role: 'controller 输出', note: '最终答案', reward: '随 trajectory', kind: 'out' }, roundtag: '循环若干轮后结束' },
+  ]}
+  adv={[
+    { kind: 'none', html: '<b>advantage</b>：<b>每条 trajectory 在自己的 group 内算</b>（trajectory-level）——这是与 V1 之前 episode-level 的关键差别。' },
+  ]}
+  loopNote="<b>结果</b>：tool call 次数上不去、指标抖动，仍训不上去。"
+/>
+
+- **tool reward**（答对 1 / 答错 0 / format error −1）：solver 类抓 $\boxed{\cdot}$ 答案对 GT；verifier 抓 $\boxed{\texttt{Right/Wrong}}$ 与真值一致才算对；bug-report-reviewer 抓 $\boxed{\texttt{Agree/Disagree}}$ 同理。
+- **advantage**：每条 trajectory 在自己的 group 内算（trajectory-level）。
+- **结果**：tool call 上不去、指标抖动，**仍训不上去**。
+
+### B.3 V2：程序化维护状态 + 状态转移过程 reward（§6.2）
+
+> 与 V1 的本质区别：引入**程序维护的状态机**（不计 loss 的外部模块），controller 调用时**只输出 hint**，task/solution/bug-report 由程序自动拼给 tool（不再由 controller 抄写）。reward = 状态转移过程 reward。
+
+<WorkflowDiagram
+  id="fig-b3"
+  backLink={{ href: '#sec-v2', label: '回到 §6.2 V2' }}
+  title="图 B.3 · V2 程序化维护状态 + 状态转移过程 reward"
+  caption="与 V1 的核心差异：<b>状态由程序托管</b>（橙色状态机，不计 loss），controller <b>只输出 hint</b>、不再抄写 task/solution/bug-report。reward 看过程：r = V(s′best) − V(s)。混合长度训练（controller 16k、tool 32k）。"
+  legend={[
+    { color: '#868e96', label: '输入（环境，不计 loss）' },
+    { color: '#1971c2', label: 'controller 样本（16k，只输出 hint）' },
+    { color: '#f08c00', label: '程序状态机（不计 loss）' },
+    { color: '#2f9e44', label: 'tool 样本（32k）' },
+  ]}
+  columns={[
+    { node: { role: '输入', note: 'prompt + 题目', kind: 'io' } },
+    { node: { role: 'controller（16k）', note: '决策 + 只输出 hint', reward: 'r = V(s′best) − V(s)；非法 −1', kind: 'ctrl' }, roundtag: 'group：同题同状态' },
+    { node: { role: '程序状态机', note: '维护 current solution /<br/>bug-report，自动拼接给 tool', kind: 'env' } },
+    { node: { role: 'sub-agent（32k）', note: 'solver / verifier …<br/>输出 boxed 答案', reward: '✓1 / ✗0 / fmt−1', kind: 'tool' }, roundtag: 'group：同题同角色 (problem_id, role)' },
+  ]}
+  adv={[
+    { kind: 'c', html: '<b>controller reward（过程）</b>：状态 = <b>Oracle</b>（真解对否）× <b>Perception</b>（自认知：未验证/通过/不通过/输出），各赋值 V(s)。r = V(s′best) − V(s)，即当前状态经合法 action 理论可达最佳分 − 当前分；非法 action −1。用意是<b>剥离 tool 返回质量噪声</b>。' },
+    { kind: 's', html: '<b>group 划分</b>：tool 按"同题同角色 (problem_id, role)"成组；controller 按"同题同状态"成组。' },
+  ]}
+  loopNote="❌ <b>结果</b>：controller reward 能学会，但 tool reward 基本不变、val 基本不涨、entropy 越训越低 → 仍训不上去。副产物：把（错误,不通过）状态价值从 0.5 下调到 0.1。"
+/>
+
+- **程序化维护状态（vs V1）**：V1 里 controller 每轮抄写完整 task/solution/bug-report 给 tool；V2 改由程序维护状态机，controller **只输出 hint**。
+- **状态转移过程 reward**：状态 = Oracle × Perception，每状态赋价值 $V(s)$（如 $(\text{正确},\text{输出})=2$、$(\text{错误},\text{输出})=-1$、$(\text{错误},\text{不通过})=0.1$）；$r = V(s'_{\text{best}}) - V(s)$，非法 action −1。
+- **advantage**：tool 按"同题同角色 (problem_id, role)"成组；controller 按"同题同状态"成组。
+- **结果**：controller reward 能学会，但 **val 基本不涨**、entropy 越训越低 → **仍训不上去**。
+
+### B.4 V3：删除 prompt 引导 + reward 简化为规则抓（§6.3）
+
+> 流程结构同 V2（见 [图 B.3](#fig-b3)），但**彻底删去 prompt 结构性引导**，且 reward 从"状态转移过程"**简化为规则抓**（verifier 的 Right/Wrong、solver 的答案）。
+
+<WorkflowDiagram
+  id="fig-b4"
+  backLink={{ href: '#sec-v3', label: '回到 §6.3 V3' }}
+  title="图 B.4 · V3 删 prompt 引导 + 规则抓 reward"
+  caption="结构同 V2 的程序化状态机，但 controller 的 prompt 结构性引导被<b>彻底删除</b>（让模型自学策略），reward 从 V2 的状态转移过程 reward <b>简化为规则抓</b>：直接用规则判每条 trajectory 的对错。"
+  legend={[
+    { color: '#868e96', label: '输入（环境，不计 loss）' },
+    { color: '#1971c2', label: 'controller 样本（无 prompt 结构引导）' },
+    { color: '#f08c00', label: '程序状态机（不计 loss）' },
+    { color: '#2f9e44', label: 'tool 样本' },
+  ]}
+  columns={[
+    { node: { role: '输入', note: 'prompt + 题目', kind: 'io' } },
+    { node: { role: 'controller', note: '只给 hint（无结构引导）', reward: '规则抓：✓1/✗0/fmt−1', kind: 'ctrl' }, roundtag: 'group：同题同状态' },
+    { node: { role: '程序状态机', note: '维护 solution / bug-report', kind: 'env' } },
+    { node: { role: 'sub-agent', note: 'solver / verifier …<br/>输出 boxed 答案', reward: '✓1 / ✗0 / fmt−1', kind: 'tool' }, roundtag: 'group：同题同角色' },
+  ]}
+  adv={[
+    { kind: 's', html: '<b>reward（规则抓，vs V2 的过程 reward）</b>：不再算 V(s′best)−V(s)，而是规则直接判——solver 抓 boxed 答案对 GT、verifier 抓 Right/Wrong 与真值是否一致、reviewer 抓 Agree/Disagree；对/错→1/0，format error→−1。' },
+    { kind: 'c', html: '<b>本质</b>：V3 相比 V2 流程图几乎一样，差别只在"删 prompt 引导 + reward 用规则抓"——所以放在一起对照看最清楚。' },
+  ]}
+  loopNote="❌ <b>结果</b>：初始 pass@1 反而更低；出现明显过拟合（训练集 pass@k 涨、val 不涨）→ 仍未突破。"
+/>
+
+- **vs V2**：① 彻底删 prompt 结构性引导；② reward 由状态转移过程 reward **简化为规则抓**（verifier 的 True/False、solver 的答案这类，直接抓）。
+- **结果**：初始 pass@1 反而更低；**过拟合**（训练集 pass@k 涨、val 不涨）→ 仍未突破。
+
+### B.5 V4：削减角色 + 并行 solver（终态，训上去 · §6.4）
+
+> 角色精简到两类：🟦 controller（调用/筛选/判断）+ 🟩 solver。controller **一次并行**发起 k 个 solver。
+
+<WorkflowDiagram
+  id="fig-v4"
+  backLink={{ href: '#sec-v4', label: '回到 §6.4 V4' }}
+  title="图 B.5 · V4 可训并行 workflow —— reward / advantage / group 一图看全"
+  caption="一条 trajectory 从左到右：problem 分叉 → controller 调用轮（并行发起 k 个 solver）→ solver 并行解题 → controller 调用轮（带 hint 再发一批）→ … → controller 输出轮。<b>每个彩框 = 一次 assistant 推理 = 一条训练样本</b>。"
+  legend={[
+    { color: '#e8590c', label: 'problem（环境输入，不计 loss）' },
+    { color: '#1971c2', label: 'controller 调用轮（调用/筛选/判断）' },
+    { color: '#2f9e44', label: 'solver 样本（解题）' },
+    { color: '#ae3ec9', label: 'controller 输出轮（终答）' },
+  ]}
+  columns={[
+    { node: { role: 'problem', note: 'prompt + 题目', kind: 'prob' } },
+    {
+      node: { role: 'controller · 调用轮①', note: '并行发起 k 个 solver', reward: 'r=1（第一轮必给）', kind: 'ctrl' },
+      roundtag: 'round 1',
+    },
+    {
+      group: {
+        label: 'solver group：同 problem 所有 solver 同组算 advantage',
+        kind: 'solver',
+        nodes: [
+          { role: 'solver₁', reward: '✓1 / ✗0 / fmt−1', kind: 'solver' },
+          { role: 'solver₂', reward: '✓1 / ✗0 / fmt−1', kind: 'solver' },
+          { role: 'solver_k', reward: '✓1 / ✗0 / fmt−1', kind: 'solver' },
+        ],
+      },
+      roundtag: '并行解题 → 结果拼回 context（不含各 solver 的 think）',
+    },
+    {
+      node: { role: 'controller · 调用轮②', note: '无正解 → 带 hint 再并行', reward: '已有正解仍调用→0；否则→1', kind: 'ctrl' },
+      roundtag: 'round 2 …（循环）',
+    },
+    {
+      node: { role: 'controller · 输出轮', note: '筛选并给出终答', reward: '✓1 / ✗0 / fmt−1', kind: 'out' },
+      roundtag: '命中正解时输出',
+    },
+  ]}
+  adv={[
+    { kind: 's', html: '<b>solver 的 advantage</b>：一个 problem 下的<b>所有 solver 样本</b>（跨所有调用轮）成一个 group，组内算 advantage。' },
+    { kind: 'c', html: '<b>controller 的 advantage</b>：一个 problem 下的<b>所有 controller 轮</b>（调用轮 + 输出轮）成一个 group，组内算 advantage。' },
+    { kind: 'full', html: '<span class="badv">全流程可训 ▸</span> controller 与 solver <b>共享同一份权重</b>；同一条 trajectory 的 solver 样本<b>共享其 controller 的 advantage</b>，<b>所有样本一起进 RL 训练</b>。' },
+  ]}
+/>
+
+- **reward**：
+  - controller 输出轮 / solver：答对 1 / 答错 0 / format error −1；
+  - controller 调用轮：调用前一轮**已有 potential right answer 却仍调用** → 判断错误给 **0**；否则（含第一轮）→ 判断正确给 **1**。
+- **advantage**：tool = 一个 problem 的所有 solver 成组；controller = 一个 problem 的所有输出轮 / 调用轮成组。
+- **全流程可训**：🟦controller 与 🟩solver **共享权重**，同一 trajectory 的 solver 样本**共享其 controller 的 advantage**，**所有样本一起训**。
+- **结果**：**第一个真正训上去的版本** → pass@1 54.29 → 66.98（§7）。
+

@@ -1,0 +1,69 @@
+---
+/**
+ * 图片组件：单图或图组 + 统一说明文字。
+ * Props:
+ *  - src:     单图路径（与 images 二选一）
+ *  - images:  [{src, label?}] 图组（横向排列，自动换行）
+ *  - alt:     alt 文本
+ *  - cols:    图组每行列数（默认按数量自适应）
+ *  - caption: 图说明（支持 HTML）
+ *  - id:      锚点
+ */
+interface Img { src: string; label?: string; }
+interface Props {
+  src?: string;
+  images?: Img[];
+  alt?: string;
+  cols?: number;
+  caption?: string;
+  id?: string;
+}
+import { withBase } from '../utils/url';
+const { src, images, alt = '', cols, caption, id } = Astro.props;
+const list: Img[] = images ?? (src ? [{ src }] : []);
+const n = cols ?? Math.min(list.length, 4);
+---
+
+<figure class="imgfig" id={id}>
+  <div class="imggrid" style={`--cols:${n}`}>
+    {list.map((im) => (
+      <div class="imgcell">
+        <img src={withBase(im.src)} alt={alt} loading="lazy" />
+        {im.label && <span class="imglabel" set:html={im.label} />}
+      </div>
+    ))}
+  </div>
+  {caption && <figcaption set:html={caption} />}
+</figure>
+
+<style>
+  .imgfig { margin: 1.8em 0; }
+  .imggrid {
+    display: grid;
+    grid-template-columns: repeat(var(--cols), 1fr);
+    gap: 10px;
+    align-items: start;
+  }
+  .imgcell { margin: 0; }
+  .imgfig :global(img) {
+    margin: 0;
+    width: 100%;
+  }
+  .imglabel {
+    display: block;
+    text-align: center;
+    font-size: 12px;
+    color: var(--text-soft);
+    margin-top: 4px;
+  }
+  figcaption {
+    margin-top: 0.7em;
+    font-size: 13.5px;
+    line-height: 1.6;
+    color: var(--text-soft);
+    text-align: left;
+  }
+  @media (max-width: 640px) {
+    .imggrid { grid-template-columns: repeat(2, 1fr); }
+  }
+</style>

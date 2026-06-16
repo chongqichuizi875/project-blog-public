@@ -1,0 +1,69 @@
+---
+/**
+ * V2 状态 → 动作 → reward 完整矩阵（§6.2，来自 xlsx 状态转移矩阵）
+ * 行 = 状态（Oracle × 模型认知），列 = controller 可选动作，格子 = 该动作的 reward。
+ * reward = V(可达最佳状态) − V(当前状态)。× = 该状态下此动作非法/不适用。
+ */
+const actions = ['solver', 'self-improve', 'verifier', 'bug-report-reviewer', 'corrector', '输出'];
+
+const rows = [
+  { oracle: '—',     percep: '无答案',  v: 0,    cls: 'neu', r: [1, null, null, null, null, null] },
+  { oracle: '✅ 正确', percep: '未验证',  v: 1,    cls: 'ok',  r: [null, 0, 0.5, null, null, null] },
+  { oracle: '✅ 正确', percep: '通过',    v: 1.5,  cls: 'ok',  r: [null, null, 0, null, null, 0.5] },
+  { oracle: '✅ 正确', percep: '不通过',  v: 0.5,  cls: 'ok',  r: [null, null, null, 1, 0.5, null] },
+  { oracle: '✅ 正确', percep: '输出',    v: 2,    cls: 'ok',  term: true, r: [] },
+  { oracle: '❌ 错误', percep: '未验证',  v: 0,    cls: 'bad', r: [null, 1, 0.1, null, null, null] },
+  { oracle: '❌ 错误', percep: '通过',    v: -0.5, cls: 'bad', r: [null, null, 0.6, null, null, -0.5] },
+  { oracle: '❌ 错误', percep: '不通过',  v: 0.1,  cls: 'bad', r: [null, null, null, 0, 0.9, null] },
+  { oracle: '❌ 错误', percep: '输出',    v: -1,   cls: 'bad', term: true, r: [] },
+];
+
+function cell(v: number) {
+  if (v > 0) {
+    const a = Math.min(1, v / 1.5);
+    return `background:rgba(47,158,68,${0.14 + a * 0.5})`;
+  }
+  if (v < 0) {
+    const a = Math.min(1, -v / 1);
+    return `background:rgba(207,34,46,${0.14 + a * 0.5})`;
+  }
+  return 'background:var(--bg-soft)';
+}
+---
+
+<div class="samatrix">
+  <div class="sa-title">状态 → 动作 → reward 矩阵：每个状态下 controller 该调谁、调了得多少分</div>
+  <div class="sa-scroll">
+    <table class="sa">
+      <thead>
+        <tr>
+          <th class="oh">Oracle</th>
+          <th class="ph">模型认知</th>
+          <th class="vh">V(s)</th>
+          {actions.map((a) => <th class="ah">{a}</th>)}
+        </tr>
+      </thead>
+      <tbody>
+        {rows.map((row) => (
+          <tr class={row.cls}>
+            <th class="oc">{row.oracle}</th>
+            <th class="pc">{row.percep}</th>
+            <td class="vc">{row.v}</td>
+            {row.term
+              ? <td class="term" colspan={actions.length}>终止状态（无后续动作）</td>
+              : row.r.map((rv) =>
+                  rv === null
+                    ? <td class="x">×</td>
+                    : <td class="rv" style={cell(rv)}>{rv > 0 ? '+' + rv : rv}</td>
+                )}
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  </div>
+  <p class="sa-note">
+    绿越深 = reward 越高（该动作把状态推得越好），红 = 负 reward，<span class="xk">×</span> = 该状态下此动作非法。
+    一眼可读出 controller 学到的「最优策略」：未验证就 verify、被判不通过就 corrector/reviewer、确认正确才输出——
+    且<b>只有「正确·输出」(V=2) 是真正想抵达的终点</b>。
+  </p>
+</div>

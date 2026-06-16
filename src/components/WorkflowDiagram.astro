@@ -1,0 +1,112 @@
+---
+/**
+ * 通用 Workflow 流程图组件
+ * 数据驱动：传入横向时间流的若干"列"，每列是一个节点或一个 group(含多节点)。
+ * 统一标注：角色配色 + reward 角标 + group 虚线框 + advantage 说明卡。
+ *
+ * Props:
+ *  - id:        锚点 id（正文链接用）
+ *  - title:     图标题
+ *  - caption:   图说明
+ *  - legend:    [{color, label}] 图例
+ *  - columns:   [Column] 横向时间流
+ *  - adv:       [{kind:'s'|'c'|'full', html}] advantage 说明卡（可空）
+ *  - loopNote:  循环说明（可空，显示在流程下方）
+ *
+ * Column 形态二选一：
+ *  - 单节点:  { node: Node }
+ *  - 分组:    { group: {label, kind:'solver'|'ctrl'|'tool', nodes:[Node]} }
+ *  - 之后可跟 roundtag: '...'（列底注脚）
+ *
+ * Node: { role, note?, reward?, kind:'prob'|'ctrl'|'solver'|'out'|'tool'|'env'|'io' }
+ */
+interface Node {
+  role: string;
+  note?: string;
+  reward?: string;
+  kind: string;
+}
+interface Column {
+  node?: Node;
+  group?: { label: string; kind: string; nodes: Node[] };
+  roundtag?: string;
+  arrowAfter?: boolean; // 该列之后是否画箭头，默认 true
+}
+interface Props {
+  id: string;
+  title: string;
+  caption?: string;
+  legend?: { color: string; label: string }[];
+  columns: Column[];
+  adv?: { kind: string; html: string }[];
+  loopNote?: string;
+  loopArc?: string; // 在流程上方画一条循环回弧 + 文字，凸显多轮交替
+  backLink?: { href: string; label: string }; // ↩ 回到正文对应章节
+}
+const { id, title, caption, legend = [], columns, adv = [], loopNote, loopArc, backLink } = Astro.props;
+---
+
+<figure id={id} class="wffig">
+  <div class="wf-head">
+    <p class="wf-title">{title}</p>
+    {backLink && <a class="wf-back" href={backLink.href}>↩ {backLink.label}</a>}
+  </div>
+  {caption && <p class="wf-cap" set:html={caption} />}
+
+  {legend.length > 0 && (
+    <div class="wf-legend">
+      {legend.map((l) => (
+        <span class="lg"><span class="sw" style={`background:${l.color}`}></span>{l.label}</span>
+      ))}
+    </div>
+  )}
+
+  <div class={`wf-flowwrap${loopArc ? ' has-arc' : ''}`}>
+    {loopArc && (
+      <div class="wf-arc">
+        <span class="wf-arc-label" set:html={loopArc} />
+      </div>
+    )}
+    <div class="wf-flow">
+      {columns.map((col, i) => (
+        <>
+          <div class="wf-col">
+            {col.node && (
+              <div class={`wf-node ${col.node.kind}`}>
+                <span class="role">{col.node.role}</span>
+                {col.node.note && <span class="note" set:html={col.node.note} />}
+                {col.node.reward && <span class="wf-rw">{col.node.reward}</span>}
+              </div>
+            )}
+            {col.group && (
+              <div class={`wf-group ${col.group.kind}grp`}>
+                <span class="wf-grouplabel">{col.group.label}</span>
+                {col.group.nodes.map((n) => (
+                  <div class={`wf-node ${n.kind}`}>
+                    <span class="role">{n.role}</span>
+                    {n.note && <span class="note" set:html={n.note} />}
+                    {n.reward && <span class="wf-rw">{n.reward}</span>}
+                  </div>
+                ))}
+              </div>
+            )}
+            {col.roundtag && <p class="wf-roundtag" set:html={col.roundtag} />}
+          </div>
+          {col.arrowAfter !== false && i < columns.length - 1 && (
+            <div class="wf-arrow">→</div>
+          )}
+        </>
+      ))}
+    </div>
+  </div>
+
+  {loopNote && <p class="wf-loop" set:html={loopNote} />}
+
+  {adv.length > 0 && (
+    <div class="wf-adv">
+      {adv.map((a) => (
+        <div class={`adv-card ${a.kind}`} set:html={a.html} />
+      ))}
+    </div>
+  )}
+</figure>
