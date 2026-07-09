@@ -16,96 +16,198 @@ import Figure from '../../components/Figure.astro';
 > - **理论结果**：从 finite-horizon 性能差分恒等式出发，借助 Abel summation 把残差按前缀约束重构，给出 CPPO 的 **monotonic improvement bound**，比同期已落地实验、有收敛性保证的工作（DPPO 的 uniform token-level trust region、TRM-Avg/Max 的序列级判据）都更紧。
 > - **影响力**：工作发布后于社交平台同步宣传，**24 小时内** [小红书帖子](https://www.xiaohongshu.com/explore/6a2974010000000021021b9d?xsec_token=ABfDyJmEHiuM2QjfLkIB3OcF3WqJsIBa3TBNZYPap8OUc=&xsec_source=pc_search&source=web_explore_feed) 点赞与收藏 **100+**、[X（推特）帖子](https://x.com/NickZhou523786/status/2066106644736667838) 点赞与收藏 **350+**。
 
-针对 PPO/GRPO/DPPO 在自回归生成中对所有 token 施加位置无关的统一 trust-region 阈值这一结构性缺陷，提出 **CPPO**（<i><b>C</b>umulative <b>P</b>refix-divergence <b>P</b>olicy <b>O</b>ptimization</i>）——一个把 token-level trust region 与 LLM 自回归结构对齐的掩码规则，作为 drop-in token mask 即可替换 PPO/GRPO/DPPO 的裁剪/掩码逻辑，不引入任何新的 loss 项。
+<Figure
+  id="fig-overview"
+  images={[
+    { src: '/cppo/concept-masks.png', label: 'PPO / DPPO / CPPO 的 token-level mask 条件' },
+    { src: '/cppo/teaser-aime.png',   label: 'AIME24/25/26 Avg@16 训练曲线' },
+  ]}
+  cols={2}
+  ratios={[2114, 1189]}
+  alt="CPPO 方法概览：token-level mask 条件对比与主结果曲线"
+  caption="<b>左</b>：PPO / DPPO / CPPO 的 token-level mask 条件——三者仅在 trust-region 判据 I_t 的形式上不同。更新项被保留，当且仅当它将 likelihood ratio 拉向 1（第一项），或满足各自的 I_t：PPO 用采样比率 |ρ_t − 1| ≤ ε，DPPO 用 position-independent 的散度阈值 D_t ≤ δ，<b>CPPO</b> 同时施加 position-weighted 的 token 级条件 w_t·D_t ≤ δ 与累积 prefix 条件 S_t ≤ δ + δ_b·W_{t−1}。<b>右</b>：Qwen3-30B-A3B-Base（16k rollout）验证 Avg@16 曲线，CPPO 收敛至 54.79、高于全部 baseline，CISPO 于 step 215 坍缩。"
+/>
+
+针对 PPO/GRPO/DPPO 在自回归生成中对所有 token 施加位置无关的统一 trust-region 阈值这一结构性缺陷，提出 **CPPO**（<i><b>C</b>umulative <b>P</b>refix-divergence <b>P</b>olicy <b>O</b>ptimization</i>）——一个将 token-level trust region 与 LLM 自回归结构对齐的 mask 规则，作为 drop-in token mask 即可替换 PPO/GRPO/DPPO 的裁剪/掩码逻辑，不引入任何新的 loss 项。下文按**「目标 → residual bound → 缺陷 → 机制 → 证明 → 实验」**的推导链组织，使每个量在其动机确立后才引入。
 
 > 🌐 **项目主页**：[hunyuan-cppo.github.io](https://hunyuan-cppo.github.io/)
 
 ---
 
-# 第一部分 · 方法与效果
+## 1. 背景与目标：将 trust region 归结为 residual 控制
 
-## 1. 背景：统一的 token-level trust region 与自回归结构不匹配
+RLVR（带可验证奖励的强化学习）是提升 LLM 推理能力的标准做法：策略生成回复、verifier 给出标量奖励、再以 PPO/GRPO 式的 token 级目标更新模型。训练本质上是 **off-policy** 的——每批回复由固定的 rollout 策略 $\mu$ 采样、复用若干个梯度步，被优化的策略 $\pi$ 因此持续偏离 $\mu$。无约束的更新会破坏训练稳定性、损害推理性能。
 
-RLVR（带可验证奖励的强化学习）已成为提升 LLM 推理能力的标准做法：策略生成回复、verifier 给出标量奖励、再用 PPO/GRPO 式的 token 级目标更新模型。实际训练是**离策略（off-policy）**的——每一批回复由固定的 rollout 策略 $\mu$ 采样、复用若干个梯度步，被优化的策略 $\pi$ 因此持续偏离采样它的策略。不加约束的更新会破坏训练稳定性、损害推理性能。
+抑制此漂移的经典手段是 **trust region**：约束 $\pi$ 相对 $\mu$ 的偏离幅度。现有方法的差异仅在 token 级散度的**度量方式**：
 
-为抑制这种漂移，RLVR 沿用了经典策略优化中的 **trust region** 思想：
+- **PPO / GRPO** 裁剪采样 token 的 likelihood ratio $\rho_t = \pi(y_t\mid s_t)/\mu(y_t\mid s_t)$。单 token 比率是真实散度的 single-sample Monte-Carlo 估计，方差高、且在长尾词表上标定不良。
+- **DPPO** 改用 token 级分布散度 $D_t = D_{\mathrm{TV}}(\mu(\cdot\mid s_t),\,\pi(\cdot\mid s_t))$，直接刻画下一 token 分布的变化，而非单次采样结果。
 
-- **PPO / GRPO** 对采样 token 的似然比 $\rho_t = \pi(y_t\mid s_t)/\mu(y_t\mid s_t)$ 做裁剪。但单 token 的比率是真实散度的**单样本蒙特卡洛估计**，方差高、且在长尾词表上标定不良。
-- **DPPO** 把采样比率换成对 token 级散度 $D_t = D_{\mathrm{TV}}(\mu(\cdot\mid s_t),\,\pi(\cdot\mid s_t))$ 的直接度量，反映了下一 token 分布的真实变化，而非单次采样结果。
-
-这些方法改进了**如何度量** token 级散度，却都对所有位置施加一个**统一、位置无关的阈值** $\delta$。这与 LLM 的自回归分解存在两处结构性冲突：
-
-1. **统一阈值忽略了误差传播的自回归不对称性。** 早期 token 决定了后续全部生成的条件，因此相同的 token 级散度发生在越早的位置，引起的序列级分布偏移越大。统一阈值因而**低估早期偏差、又过度限制晚期探索**。
-2. **孤立地评估 token 级散度，忽略了累积前缀漂移。** 第 $t$ 步的状态就是已生成前缀 $s_t = (x, y_{<t})$。若逐 token 偏差沿前缀累积，模型实际是在一个高度离策略的状态上生成。当条件前缀已经显著偏离 rollout 策略时，当前 token 的任何进一步偏离都带有复合风险——而统一阈值无论前缀已漂移多远，都给出**完全相同**的散度额度。
-
-<Figure
-  src="/cppo/concept-masks.png"
-  alt="PPO / DPPO / CPPO 的 token 级掩码条件对比"
-  caption="三种方法的 token 级掩码条件。更新项被保留当且仅当它把比率拉向 1（第一项），或满足各自的 trust-region 判据 I_t。PPO 用采样比率 |ρ_t − 1| ≤ ε；DPPO 用统一的分布散度 D_t ≤ δ；<b>CPPO</b> 同时施加位置加权的 token 级条件 w_t·D_t ≤ δ 与累积前缀均值条件（前缀加权平均散度 ≤ δ_b）。ρ_t 为采样 token 的似然比，D_t 为 μ 与 π 在状态 s_t 上下一 token 分布的散度。"
-/>
-
-## 2. 方法：位置加权阈值 + 累积前缀预算
-
-CPPO 不改变散度的度量方式，只**重新分配**沿回复允许的散度额度，对应上面两处缺陷给出两个耦合的机制。
-
-### 2.1 位置加权的 token 级阈值
-
-引入一个随位置**单调递减**的权重 $w_t$，并把约束施加在加权散度 $w_t D_t$ 上。实现采用线性 schedule：
+优化的终极目标是 **monotonic improvement** $J(\pi) \ge J(\mu)$。自回归分解给出精确的 finite-horizon 性能差分恒等式（记 $\rho_{a:b} = \prod_{j=a}^{b}\rho_j$）：
 
 $$
-w_t = 1 - \frac{1 - w_{\min}}{T-1}(t-1), \qquad w_t \in [w_{\min}, 1].
+J(\pi) - J(\mu) = L'_\mu(\pi) - \Delta(\mu, \pi),
 $$
 
-由于约束作用在 $w_t D_t \le \delta$ 上，它等价于一个**位置相关**的 token 级阈值 $D_t \le \delta / w_t$：在回复开头为 $\delta$，到结尾放松至 $\delta / w_{\min}$。早期位置因而只允许更小的 $D_t$，晚期位置——remaining horizon 更短、下游影响更小——被适当放松。
+其中 token 级 surrogate 目标 $L'_\mu(\pi) = \mathbb{E}_\mu\big[R\sum_t(\rho_t - 1)\big]$ 为实际被优化的量，而
+
+$$
+\Delta(\mu, \pi) = \mathbb{E}_\mu\Big[R\sum_{t=1}^{T}(\rho_t - 1)\,(1 - \rho_{t+1:T})\Big]
+$$
+
+是 surrogate 丢弃的 **suffix correction 残差**。恒等式表明：保证单调提升的关键不在于约束散度本身，而在于**极小化残差 $|\Delta|$**。残差中的因子 $1 - \rho_{t+1:T}$ 已指明症结——位置 $t$ 的偏差会进入其后**每一个** token 的条件，此即 §2 两个缺陷的共同来源。
+
+## 2. Residual bound 揭示的两个结构性缺陷
+
+设逐 token 散度满足阈值轮廓 $D_t \le \ell_t$，记 $u_t := \mathbb{E}[D_t]$ 为位置 $t$ 的期望散度。对 suffix likelihood ratio 施加 maximal coupling，残差有如下上界：
+
+$$
+|\Delta(\mu, \pi)| \;\le\; 4\xi \sum_{t=1}^{T-1} u_t \sum_{j=t+1}^{T}\ell_j \;\le\; \sum_{t=1}^{T-1}\lambda_t u_t, \qquad \lambda_t := 4\xi\,\bar\ell\,(T - t),
+$$
+
+其中 $\xi$ 为奖励绝对值上界、$\bar\ell$ 为单步散度阈值上界。该上界揭示 position-independent 统一阈值（DPPO 强制 $u_t \le \delta$）的两个结构性缺陷。
+
+**缺陷一 · 放大系数的自回归不对称。** 单步偏差 $u_t$ 的放大系数 $\lambda_t \propto (T-t)$ 随 **remaining horizon 线性增长**。早期偏差（$t$ 小）对应极大的系数：单次早期偏差令整条生成 prefix 的分布整体偏移，扭曲其后**所有** token 的条件；晚期偏差的下游影响则可忽略。position-independent 的统一阈值对二者不加区分，因而**低估早期偏差、同时过度限制晚期探索**。
+
+**缺陷二 · 最坏情况下的二次累积。** 逐点独立约束 $u_t \le \delta$ 仅能给出 $\sum_t\lambda_t u_t \le \delta\sum_t\lambda_t$，其允许的最坏情形是每一步偏差均达到上界 $\delta$。代入 $\sum_{t<T}\lambda_t = 2\xi T(T-1)\bar\ell$，残差随长度呈二次膨胀 $O(T^2\delta^2)$。然而相邻步的散度预算本可相互调剂、无需逐步都取最大漂移——逐点独立约束未能利用这一自由度。
+
+两个缺陷在实际训练中可直接观测：
 
 <Figure
   images={[
     { src: '/cppo/offline-mean-abs.png',  label: '逐位置平均 |π−μ|' },
     { src: '/cppo/offline-top10-abs.png', label: '逐位置 top-10% 尾部 |π−μ|' },
-    { src: '/cppo/weight-schedule.png',   label: 'CPPO 诱导的等效阈值 δ/w_t' },
   ]}
-  cols={3}
-  alt="逐位置策略偏移的离线诊断与 CPPO 的位置相关阈值"
-  caption="位置相关阈值的动机与形态。<b>左 / 中</b>：Qwen3-30B-A3B 在 200 个 GRPO 更新后的离线诊断，逐 token 位置统计更新后训练策略与 rollout 策略的概率偏移 |π_θ − μ|（均值与 top-10% 尾部）——偏移随位置增大，越靠后越大。<b>右</b>：递减 w_t schedule 诱导的等效 token 级阈值 δ/w_t，从开头的 δ 放松到结尾的 δ/w_min（图中 δ=0.20、w_min=0.8，即 0.20→0.25）。"
+  cols={2}
+  alt="逐位置策略偏移的离线诊断"
+  caption="缺陷的实证观测。Qwen3-30B-A3B 在 200 个 GRPO 更新后的离线诊断：逐 token 位置统计更新后策略与 rollout 策略的概率偏移 |π_θ − μ|（左=均值，右=top-10% 尾部）。统一阈值下偏移随位置单调增大——放大系数 λ_t 最大的早期位置未被额外收紧，λ_t 最小的晚期位置反而累积了最大偏移。散度预算的分配方向与 λ_t 的轮廓恰好相反。"
 />
 
-> 关键判断：右图的等效阈值形态（早紧晚松）与左/中图实测的偏移形态（早小晚大）**方向一致**——CPPO 不是凭直觉设阈值，而是让允许的散度匹配该位置散度真实能传播的范围（§5 给出形式化）。
+## 3. 两个耦合机制：position weighting + prefix-mean budget
 
-### 2.2 累积前缀预算
+两个缺陷同源于「逐 step 孤立、等额约束」。修复之道在于重构约束的**结构**，而非改变散度的度量方式——对应两个缺陷各引入一个机制。
 
-记加权前缀散度与累积权重
+**机制一 · position weight $w_t$（对应缺陷一）。** 引入随位置**单调递减**的权重 $w_t \in [w_{\min}, 1]$，将约束施加于加权散度：
 
 $$
-S_t = \sum_{j=1}^{t} w_j D_j, \qquad W_t = \sum_{j=1}^{t} w_j, \qquad S_0 = W_0 = 0.
+w_t D_t \le \delta.
 $$
 
-给定 token 级阈值尺度 $\delta$ 与前缀均值阈值 $\delta_b$，CPPO 只在如下条件成立时，保留一个把采样比率推离 1 的更新项：
+它等价于一个 **position-dependent** 的 token 级阈值 $D_t \le \delta / w_t$：阈值在序列开头为 $\delta$、至结尾放松至 $\delta / w_{\min}$。据此，$\lambda_t$ 最大的早期位置仅允许更小的 $D_t$，$\lambda_t$ 最小的晚期位置获得放松——散度额度**沿 $\lambda_t$ 由大到小的方向分配**，恰好抵消缺陷一的不对称。
+
+**机制二 · prefix-mean budget $\delta_b$（对应缺陷二）。** 将逐点独立约束升级为对**任意 prefix** 的加权均值约束：
+
+$$
+\frac{\sum_{j=1}^{m} w_j D_j}{\sum_{j=1}^{m} w_j} \le \delta_b.
+$$
+
+它不再允许每步独立取满，而是强制相邻步**共享**散度预算，直接封闭缺陷二的最坏累积路径。为在线执行该约束，记加权 prefix 散度与累积权重
+
+$$
+S_t = \sum_{j=1}^{t} w_j D_j, \qquad W_t = \sum_{j=1}^{t} w_j, \qquad S_0 = W_0 = 0,
+$$
+
+则 prefix-mean 约束即写作 $S_m \le \delta_b W_m$。
+
+**两机制的耦合。** $w_t$ 承担双重角色：既缩放单步约束（机制一），又作为 prefix 累积中每步偏差的分配权重（机制二的 $S_t, W_t$）。因此位置越靠前的偏差，在 prefix budget 中占的权重越大——两机制指向同一方向：**收紧早期、约束累积**。
+
+<Figure
+  src="/cppo/prefix-budget.png"
+  alt="累积前缀约束在一个 token 窗口上的示意"
+  caption="prefix-mean budget 的作用示意。灰柱为模拟的加权偏差 w_t·D_t。蓝色区域内 token 级阈值 δ 生效；橙色区域内 prefix 约束更严、决定有效阈值。<b>蓝柱</b>被 token 级阈值掩去；<b>橙柱</b>满足 token 级阈值、却因 prefix 已累积漂移而违反 prefix 约束、被掩去——此即逐点独立的统一阈值无法捕捉的情形。"
+/>
+
+## 4. 参数形式的数学依据：linear $w_t$ 与初始松弛的必要性
+
+机制一、二确定了约束的**结构**，但 $w_t$ 的具体函数、以及在线执行的具体阈值须由收敛要求反推——既非任取一个递减函数，亦非直接照搬 prefix-mean 约束。
+
+### 4.1 $w_t$ 为何取 linear schedule
+
+§6 的收敛证明依赖 Abel summation，其成立要求比例系数 $r_t := \lambda_t / w_t \propto (T-t)/w_t$ **关于 $t$ 单调不增**（否则展开式各项符号无法逐一确定）。这将「$w_t$ 取何形式」转化为一个明确的数学条件。linear schedule
+
+$$
+w_t = 1 - \frac{1 - w_{\min}}{T-1}(t-1)
+$$
+
+满足该条件——相邻两步之差为
+
+$$
+\frac{T-t}{w_t} - \frac{T-(t+1)}{w_{t+1}} = \frac{w_{\min}}{w_t\,w_{t+1}} > 0,
+$$
+
+严格为正，即 $r_t$ 严格递减。linear schedule 是满足此收敛条件的最简函数形式。
+
+### 4.2 在线约束为何需要初始松弛 $\delta$
+
+prefix-mean 约束 $S_m \le \delta_b W_m$ 若在线严格执行，会在首个 token（$t=1$）处强制 $D_1 \le \delta_b$。而 $\delta_b$ 极小（默认约 0.02），将扼制生成起步阶段的探索。解法是引入一个**单步尺度的初始松弛** $\delta$，将约束放宽为 $S_t \le \delta + \delta_b W_{t-1}$。据此，在线执行的**有效阈值**取 token 级条件与 prefix 条件中的更严者：
 
 $$
 w_t D_t \;\le\; c_t^{\mathrm{CPPO}} := \min\!\Big\{\, \delta,\;\; \delta + \delta_b W_{t-1} - S_{t-1} \,\Big\}.
 $$
 
-这一**有效阈值**同时强制 token 级条件 $w_t D_t \le \delta$ 与累积前缀条件 $S_t \le \delta + \delta_b W_{t-1}$（额外的 $\delta$ 项给首个 token 完整额度）。其行为是**动态的**：当前缀加权平均 $S_{t-1}/W_{t-1}$ 仍低于 $\delta_b$ 时，token 级阈值生效；一旦先前偏差把前缀均值推过 $\delta_b$，前缀项 $\delta + \delta_b W_{t-1} - S_{t-1}$ 降到 $\delta$ 以下、收紧当前 token 的额度。**trust region 随前缀漂移累积而动态收紧**，而非给每个 token 同样的额度。
+其行为是 **dynamic** 的：$t=1$ 时 $W_0 = S_0 = 0$，阈值退回 $\delta$，保全起步探索；随生成推进，一旦历史累积漂移 $S_{t-1}$ 超出 prefix budget $\delta_b W_{t-1}$，prefix 项 $\delta + \delta_b W_{t-1} - S_{t-1}$ 跌至 $\delta$ 以下、自动收紧当前 token 的额度。**trust region 随 prefix 漂移累积而动态收紧**，而非对每个 token 等额分配。该松弛在最终残差界中仅引入低阶项 $O(T\bar\ell\delta)$，不影响收紧结论（§6）。
 
-<Figure
-  src="/cppo/prefix-budget.png"
-  alt="累积前缀约束在一个 token 窗口上的示意"
-  caption="累积前缀约束示意。灰柱为模拟的加权偏差 w_t·D_t。蓝色区域为 token 级阈值 δ 生效的 token；橙色区域为前缀约束决定有效阈值的 token。绿线为最终有效阈值（取 token 级阈值与前缀调整阈值的 min）。<b>蓝柱</b>被 token 级阈值掩去；<b>橙柱</b>满足 token 级阈值、却因前缀已累积漂移而违反有效阈值、被前缀约束掩去——这正是统一阈值无法捕捉的情形。"
-/>
+## 5. 合成为单个 token-level mask
 
-### 2.3 合成为单个 token 级掩码
-
-两个条件合并为单个逐 token 判据 $I_t$，套进标准的 token 级 ratio-advantage 目标（advantage 仍用 GRPO 的 group-relative advantage）：
+两个条件合并为单个逐 token 判据 $I_t$，嵌入标准的 token 级 ratio-advantage 目标（advantage 仍采用 GRPO 的 group-relative advantage）：
 
 $$
 M_t^{\mathrm{CPPO}} = \mathbf{1}\!\big[\, \hat A_t(\rho_t - 1) \le 0 \;\;\vee\;\; I_t \,\big], \qquad I_t:\ w_t D_t \le \delta \ \wedge\ S_t \le \delta + \delta_b W_{t-1}.
 $$
 
-第一项保留所有把 $\pi$ 拉近 $\mu$ 的更新；$I_t$ 只约束把 $\pi$ 推离 $\mu$ 的项。$S_t, W_t$ 都是普通前缀和，批量实现用一次沿回复维的 cumsum + 一次右移一位即可，**无额外前向、无新 loss 项**——这使 CPPO 与 DPPO 在工程上几乎零差异，从而保证后文的对比严格隔离出「散度如何分配」这一变量。
+第一项保留所有将 $\pi$ 拉近 $\mu$ 的更新；$I_t$ 仅约束将 $\pi$ 推离 $\mu$ 的项（判据形式见开篇 [概览图](#fig-overview) 左）。$S_t, W_t$ 均为普通 prefix sum，批量实现仅需沿回复维一次 cumsum + 一次右移一位，**无额外前向、无新 loss 项**。CPPO 由此与 DPPO 在工程上几乎零差异，从而保证后文对比严格隔离出「散度如何分配」这一唯一变量。
 
-## 3. 效果：跨 Base/post-trained、dense/MoE 相比众多 baseline 的干净提升
+## 6. Abel summation：收紧 monotonic improvement bound
 
-实验覆盖 **dense 与 MoE、Base 与 post-trained** 的多个 Qwen3 设置（1.7B、1.7B-Base、8B-Base、30B-A3B-Base）。所有实验在 **DAPO-Math-17k**（约 17k 道可验证数学题）上、用 verl 的 GRPO/DAPO rollout 栈训练，验证用 AIME24/25/26 的 **Avg@16**、主指标为三者均值。为避免任何方法靠更长训练预算取巧，每个方法都在**相同的评测窗口** $[0, T^{\mathrm{stop}}]$ 内取其验证曲线最优点。
+### 6.1 证明
+
+prefix-mean budget 等价于：去中心化 prefix slack $\tilde S_m := \sum_{j=1}^{m} w_j (u_j - \delta_b) \le 0$（$m = 1,\dots,T-1$）。将残差界与其常数项作差，用 Abel summation（离散分部求和）改写，令 $r_t = \lambda_t / w_t$：
+
+$$
+\sum_{t<T}\lambda_t u_t - \delta_b\sum_{t<T}\lambda_t \;=\; r_{T-1}\tilde S_{T-1} + \sum_{t=1}^{T-2}(r_t - r_{t+1})\,\tilde S_t.
+$$
+
+右侧每一项均为「非负系数 $\times$ 非正 slack」：系数 $r_t - r_{t+1} \ge 0$ 由 §4.1 的单调性保证，slack $\tilde S_t \le 0$ 由 prefix budget 保证。故整体 $\le 0$，得
+
+$$
+\sum_{t<T}\lambda_t u_t \;\le\; \delta_b\sum_{t<T}\lambda_t \;=\; 2\xi T(T-1)\,\bar\ell\,\delta_b.
+$$
+
+Abel summation 将「逐点取满」的最坏路径替换为「prefix-mean 受限」的约束族——$\lambda_t$ 越大的早期位置被压得越紧，残差界中逐点的 $\delta$ 由更小的 prefix-mean $\delta_b$ 取代（$u_t \equiv \delta_b$ 时取等，故对此约束族为紧）。由此得 CPPO 的 monotonic improvement bound：
+
+$$
+J(\pi) - J(\mu) \;\ge\; L'_\mu(\pi) - 2\xi T(T-1)\,\bar\ell\,\delta_b.
+$$
+
+### 6.2 与同期工作的残差常数对照
+
+把 $\sum_{t<T}\lambda_t = 2\xi T(T-1)\bar\ell$ 代入，各方法的残差常数 $C$ 为：
+
+<div class="table-scroll">
+<table class="cppo-main">
+  <thead>
+    <tr><th>方法</th><th>trust-region 形式</th><th>残差常数 C</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>DPPO（uniform token-level）</td><td>逐点 $D_t\le\delta$，无前缀约束</td><td>$2\xi T(T-1)\,\delta^2$</td></tr>
+    <tr><td>TRM-Max</td><td>序列级 $\max_t D_t\le\delta$</td><td>$2\xi T(T-1)\,\delta^2$（同 DPPO）</td></tr>
+    <tr><td>TRM-Avg</td><td>仅在终端约束整条均值</td><td>$\approx (2-\tfrac{2}{T})\cdot C_{\mathrm{CPPO}}^{w\equiv1}$</td></tr>
+    <tr class="ours"><td><b>CPPO（ours）</b></td><td>position weighting + <b>每个 prefix</b> 均值受限</td><td>$2\xi T(T-1)\,\delta\,\delta_b$</td></tr>
+  </tbody>
+</table>
+</div>
+
+- **vs DPPO（uniform token-level trust region）**：DPPO 将 $\delta$ 同时用作 $\bar\ell$ 与 $u_t$ 的上界，常数为 $\delta^2$；CPPO 保留同一 $\bar\ell=\delta$，但 prefix 约束将 $u_t$ 项之和压至 $\delta_b$，得 $\delta\cdot\delta_b$。二者之比 $C_{\mathrm{CPPO}}/C_{\mathrm{DPPO}}=\delta_b/\delta$，在 $\delta_b<\delta$ 时严格更紧。
+- **vs TRM-Max**：$\max_t D_t\le\delta$ 蕴含每个 $u_t\le\delta$，与 DPPO 落至完全相同的二次常数 $\delta^2$——序列级取 max 无法改善逐点最坏累积。
+- **vs TRM-Avg**：仅在**整条回复的终端**约束一次均值，等价于只保留最后一个 prefix 约束。直接计算给 $C_{\mathrm{terminal}}\le 4\xi\bar\ell(T-1)^2\delta_b$，而 CPPO（$w\equiv1$ 时）用上**每一个** prefix 得 $2\xi T(T-1)\bar\ell\delta_b$，二者之比为 $2-\tfrac{2}{T}$——即终端约束最坏松约 2 倍，因其允许早期 prefix 大幅超标、再于后段拉回均值。CPPO 在每个 $m$ 均强制 $S_m\le\delta_b W_m$，杜绝此「早超标、晚补偿」。
+
+> 关键判断：三条对照表明，CPPO 的更紧并非源于更小的阈值或更强的散度度量，而是源于**将约束施加于每个 prefix 的加权均值**——Abel summation 正是把这一约束结构转化为更小残差常数的工具。position weighting 部分进一步给出 $C_{\mathrm{CPPO}}/C_{\mathrm{uniform}}\le \delta_b/(\delta w_{\min})$，其中 $1/w_{\min}$ 是放松晚期阈值的代价。理论收紧的方向（约束累积漂移、对早期收紧）与 §7 实测增益在大模型 / 长 horizon 上最显著、与 DPPO 差距随训练扩大的现象互为印证。
+
+---
+
+## 7. 实验：跨 Base/post-trained、dense/MoE 的一致提升
+
+实验覆盖 **dense 与 MoE、Base 与 post-trained** 的多个 Qwen3 设置（1.7B、1.7B-Base、8B-Base、30B-A3B-Base）。所有实验在 **DAPO-Math-17k**（约 17k 道可验证数学题）上、以 verl 的 GRPO/DAPO rollout 栈训练，验证用 AIME24/25/26 的 **Avg@16**、主指标为三者均值。为排除任何方法凭更长训练预算取巧，每个方法均在**相同评测窗口** $[0, T^{\mathrm{stop}}]$ 内取其验证曲线最优点。
 
 <div class="table-scroll">
 <table class="cppo-main">
@@ -128,91 +230,19 @@ $$
 
 三点结论：
 
-- **全面取得干净提升，且大模型增益最大**：CPPO 相比 GRPO、CISPO、MinPRO、DPPO、TRM 等众多 baseline，在跨 Base/post-trained、dense/MoE 的各设置上均取得最佳，较次优的绝对领先分别为 **+3.06 / +0.91 / +1.39 / +5.56**。最大增益出现在 **Qwen3-30B-A3B-Base**——这是唯一的 16k rollout 设置，也正是 §5 中「remaining-horizon 放大」最显著的区域（早期 token 偏差要穿过更长的后缀传播）。
-- **与 DPPO 的对比严格受控**：二者共用同一套 Top-K（K=20）reduced-TV 散度与同一 per-model 阈值尺度 $\delta$，**仅差在加权与前缀约束**。在此匹配设置下 CPPO 较 DPPO **+3.69 / +1.88 / +2.22 / +5.56**——增益确定地来自「散度如何沿回复分配」，而非换了更好的散度度量或更松的阈值。
-- **稳定性**：在 30B-A3B-Base 上，CISPO 中途坍缩、序列级的 TRM-Max 退化至 20.27，而 CPPO 稳定训练到选定 checkpoint。其中 AIME24 单项达到 **64.79**（AIME25 43.13、AIME26 56.46）。
+- **全设置一致最佳，且大模型增益最大**：CPPO 相比 GRPO、CISPO、MinPRO、DPPO、TRM 等 baseline，在跨 Base/post-trained、dense/MoE 的各设置上均取得最佳，较次优的绝对领先分别为 **+3.06 / +0.91 / +1.39 / +5.56**。最大增益出现在 **Qwen3-30B-A3B-Base**——唯一的 16k rollout 设置，亦即 §2「remaining-horizon 放大」最显著的区域（早期 token 偏差须穿越更长的 suffix 传播）。
+- **与 DPPO 的对照严格受控**：二者共用同一套 Top-K（K=20）reduced-TV 散度与同一 per-model 阈值尺度 $\delta$，**仅在 weighting 与 prefix 约束上不同**。此匹配设置下 CPPO 较 DPPO **+3.69 / +1.88 / +2.22 / +5.56**——增益确定源于「散度沿回复的分配方式」，而非更优的散度度量或更松的阈值。
+- **稳定性**：在 30B-A3B-Base 上，CISPO 中途坍缩、序列级的 TRM-Max 退化至 20.27，而 CPPO 稳定训练至选定 checkpoint。其中 AIME24 单项达 **64.79**（AIME25 43.13、AIME26 56.46）。
 
 <Figure
   src="/cppo/main-curves.png"
   alt="三个 Base 模型的验证 AIME24/25/26 Avg@16 训练曲线"
-  caption="三个 Base 模型设置（1.7B-Base / 8B-Base / 30B-A3B-Base）的验证 AIME24/25/26 Avg@16 曲线。CPPO（蓝）在整个训练过程中持续保持领先；与最强基线 DPPO 的差距随训练推进而<b>扩大</b>——与前缀约束「仅在策略偏差沿前缀累积之后才收紧」的机制一致。"
+  caption="三个 Base 模型设置（1.7B-Base / 8B-Base / 30B-A3B-Base）的验证 AIME24/25/26 Avg@16 曲线。CPPO（蓝）全程保持领先；与最强 baseline DPPO 的差距随训练推进而<b>扩大</b>——与 prefix 约束「仅在策略偏差沿 prefix 累积之后才收紧」的机制一致。"
 />
 
----
+## 8. 消融：增益源于「分配」而非「度量」
 
-# 第二部分 · 理论与消融分析
-
-> 本部分回答两个问题：**① 为什么位置加权 + 前缀预算能给出比统一阈值更紧的 improvement bound（理论）；② 两个机制各自贡献多少、对散度度量/近似是否鲁棒（消融）。**
-
-## 4. 理论：比同期工作更紧的 monotonic improvement bound
-
-### 4.1 残差从何而来
-
-固定 rollout 策略 $\mu$、在公共支撑上优化 $\pi$。记 $\rho_{a:b} = \prod_{j=a}^{b}\rho_j$。自回归分解给出**精确的 finite-horizon 性能差分恒等式**：
-
-$$
-J(\pi) - J(\mu) = L'_\mu(\pi) - \Delta(\mu, \pi),
-$$
-
-其中 token 级 surrogate 目标 $L'_\mu(\pi) = \mathbb{E}_\mu\big[R\sum_t(\rho_t - 1)\big]$，而残差
-
-$$
-\Delta(\mu, \pi) = \mathbb{E}_\mu\Big[R\sum_{t=1}^{T}(\rho_t - 1)\,(1 - \rho_{t+1:T})\Big].
-$$
-
-trust region 真正要控制的是这个残差 $|\Delta|$——它来自被 surrogate 目标丢弃的**suffix correction** $1 - \rho_{t+1:T}$：第 $t$ 个 token 的偏差，会进入它之后**每一个** token 的条件。
-
-### 4.2 remaining-horizon 放大
-
-设逐 token 散度满足阈值轮廓 $D_t \le \ell_t$，$u_t := \mathbb{E}[D_t]$ 为位置 $t$ 的期望散度。对后缀似然比做最大耦合可得残差界：
-
-$$
-|\Delta(\mu, \pi)| \;\le\; 4\xi \sum_{t=1}^{T-1} u_t \sum_{j=t+1}^{T}\ell_j \;\le\; \sum_{t=1}^{T-1}\lambda_t u_t, \qquad \lambda_t := 4\xi\,\bar\ell\,(T - t).
-$$
-
-系数 $\lambda_t \propto (T - t)$ 随 **remaining horizon 线性增长**——这把第一处缺陷量化了：一次早期偏差把生成前缀的分布整体偏移，扭曲后续所有 token 的条件，其残差误差在整个后缀上累积。统一阈值 $D_t \le \delta$ 完全忽略这一轮廓，于是**低估携带最大 remaining-horizon 乘子的早期偏差、又过度惩罚几乎无下游影响的晚期偏差**。
-
-### 4.3 前缀约束把 bound 收紧
-
-CPPO 通过加权前缀均值施加约束 $w_t D_t \le c_t$、$P_m \le \delta_b W_m$。其 policy-improvement bound 为：
-
-$$
-J(\pi) - J(\mu) \;\ge\; L'_\mu(\pi) - 2\xi T(T-1)\,\bar\ell\,\delta_b.
-$$
-
-**为什么 Abel summation 能把 bound 收紧。** 残差被界为 $\sum_{t<T}\lambda_t u_t$，其中 $\lambda_t\propto(T-t)$ 递减、$u_t=\mathbb{E}[D_t]$。逐点约束只能给出 $u_t\le\delta$，于是只能得到 $\sum_t\lambda_t u_t\le\delta\sum_t\lambda_t$——这等于放任策略在**每一个连续步**都顶满散度额度，而这种最坏累积恰恰把 $\pi$ 的状态访问推离 $\mu$、直接抬高 $|\Delta|$。CPPO 改为约束加权前缀**均值** $S_m=\sum_{j\le m}w_j(u_j-\delta_b)\le 0$。令 $r_t:=\lambda_t/w_t$，Abel summation（离散分部求和）把同一个和改写为
-
-$$
-\sum_{t<T}\lambda_t u_t - \delta_b\sum_{t<T}\lambda_t \;=\; r_{T-1}S_{T-1} + \sum_{t=1}^{T-2}(r_t - r_{t+1})\,S_t.
-$$
-
-只要 position-weight schedule 使 $r_t$ 单调不增（线性 $w_t$ 满足，见原文 Prop.），右侧每一项都是「非负系数 $(r_t-r_{t+1})$ × 非正 prefix slack $S_t$」，因此整体 $\le 0$，得到 $\sum_t\lambda_t u_t\le\delta_b\sum_t\lambda_t$。直觉上，Abel summation 把「逐点顶满」的最坏路径换成了「prefix 均值受限」的约束族——prefix 越早、$\lambda_t$ 越大的位置被压得越紧，于是 $\delta$ 被替换为更小的 prefix 均值 $\delta_b$，这正是 bound 收紧的来源（取 $u_t\equiv\delta_b$ 时取等，故对这族约束是紧的）。
-
-**与同期工作的 bound 对照。** 把 $\sum_{t<T}\lambda_t=2\xi T(T-1)\bar\ell$ 代入，各方法的残差常数为：
-
-<div class="table-scroll">
-<table class="cppo-main">
-  <thead>
-    <tr><th>方法</th><th>trust-region 形式</th><th>残差常数 C</th></tr>
-  </thead>
-  <tbody>
-    <tr><td>DPPO（uniform token-level）</td><td>逐点 $D_t\le\delta$，无前缀约束</td><td>$2\xi T(T-1)\,\delta^2$</td></tr>
-    <tr><td>TRM-Max</td><td>序列级 $\max_t D_t\le\delta$</td><td>$2\xi T(T-1)\,\delta^2$（同 DPPO）</td></tr>
-    <tr><td>TRM-Avg</td><td>仅在终端约束整条均值</td><td>$\approx (2-\tfrac{2}{T})\cdot C_{\mathrm{CPPO}}^{w\equiv1}$</td></tr>
-    <tr class="ours"><td><b>CPPO（ours）</b></td><td>位置加权 + <b>每个前缀</b>均值受限</td><td>$2\xi T(T-1)\,\delta\,\delta_b$</td></tr>
-  </tbody>
-</table>
-</div>
-
-- **vs DPPO（uniform token-level trust region）**：DPPO 把 $\delta$ 同时用作 $\bar\ell$ 与 $u_t$ 的上界，常数为 $\delta^2$；CPPO 保留同一个 $\bar\ell=\delta$，但前缀约束把 $u_t$ 项的总和压到 $\delta_b$，得到 $\delta\cdot\delta_b$。两者之比 $C_{\mathrm{CPPO}}/C_{\mathrm{DPPO}}=\delta_b/\delta$，在 $\delta_b<\delta$ 时严格更紧。
-- **vs TRM-Max**：$\max_t D_t\le\delta$ 蕴含每个 $u_t\le\delta$，与 DPPO 落到完全相同的二次常数 $\delta^2$——序列级取 max 并不能改善逐点最坏累积。
-- **vs TRM-Avg**：只在**整条回复的终端**约束一次均值，等价于只保留最后一个前缀约束。直接计算给 $C_{\mathrm{terminal}}\le 4\xi\bar\ell(T-1)^2\delta_b$，而 CPPO（$w\equiv1$ 时）用上**每一个**前缀得到 $2\xi T(T-1)\bar\ell\delta_b$，两者之比为 $2-\tfrac{2}{T}$——即终端约束最坏会松约 2 倍，因为它允许早期前缀大幅超标、再靠后段拉回平均。CPPO 在每个 $m$ 都强制 $S_m\le 0$，杜绝了这种「早超标、晚补偿」。
-
-> 关键判断：这三条对照说明，CPPO 的更紧并非来自更小的阈值或更强的散度度量，而是来自**把约束施加在每个前缀的加权均值上**——Abel summation 正是把这一约束结构转化为更小残差常数的工具。位置加权部分进一步给出 $C_{\mathrm{CPPO}}/C_{\mathrm{uniform}}\le \delta_b/(\delta w_{\min})$，其中 $1/w_{\min}$ 是放松晚期阈值的代价。理论收紧的方向（约束累积漂移、对早期收紧）与 §3 实测增益在大模型 / 长 horizon 上最显著、与 DPPO 差距随训练扩大的现象互证。
-
-## 5. 消融：增益来自「分配」而非「度量」
-
-我们在 Qwen3-1.7B 与 1.7B-Base 上，从匹配的 DPPO 基线出发逐步加回 CPPO 的组件。
+在 Qwen3-1.7B 与 1.7B-Base 上，从匹配的 DPPO 基线出发逐步加回 CPPO 组件，隔离每个机制的贡献。
 
 <Figure
   src="/cppo/ablation-main.png"
@@ -226,6 +256,6 @@ $$
   caption="Qwen3-1.7B-Base 消融。<b>左 · 超参敏感性</b>：在默认 (δ_b, w_min)=(0.02, 0.8) 邻域内扫参，相邻设置都贴近默认且高于 DPPO，增益不依赖单一工作点。<b>中 · KL vs TV</b>：把 Top-K reduced-TV 换成 KL 散度、CPPO 前缀约束不变，效果与 TV 相当且持续优于 DPPO；作为对照，把同样两个阈值用 TRM 的<b>序列级</b>掩码施加（按整条回复的 max/mean 取舍）只追平 DPPO，说明增益来自「以<b>前缀预算</b>形式施加阈值」而非阈值取值本身。<b>右 · Binary vs Top-K</b>：换用更简单的 Binary-TV 近似，两种配置都维持相近分数并优于 DPPO——增益对散度估计器的粒度鲁棒。"
 />
 
-三条结论收敛到同一点：CPPO 的增益**来自如何沿回复分配散度预算（位置顺序 + 前缀累积），而非散度的度量方式或近似粒度**。这与 §4 的理论一致——收紧的是残差常数中「逐点 $\delta$ → 前缀均值 $\delta_b$」这一项，与具体用 TV 还是 KL、Top-K 还是 Binary 无关。
+三条结论收敛于同一点：CPPO 的增益**源于散度预算沿回复的分配方式（position order + prefix 累积），而非散度的度量方式或近似粒度**。这与 §6 的理论一致——收紧的是残差常数中「逐点 $\delta$ → prefix-mean $\delta_b$」这一项，与采用 TV 抑或 KL、Top-K 抑或 Binary 无关。
 
 > 🌐 更多细节、完整曲线与可视化见项目主页：[hunyuan-cppo.github.io](https://hunyuan-cppo.github.io/)

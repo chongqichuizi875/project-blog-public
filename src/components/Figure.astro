@@ -6,6 +6,7 @@
  *  - images:  [{src, label?}] 图组（横向排列，自动换行）
  *  - alt:     alt 文本
  *  - cols:    图组每行列数（默认按数量自适应）
+ *  - ratios:  各列宽度比（fr）；长度需与图数一致。用于让不同宽高比的图等高显示
  *  - caption: 图说明（支持 HTML）
  *  - id:      锚点
  */
@@ -15,17 +16,24 @@ interface Props {
   images?: Img[];
   alt?: string;
   cols?: number;
+  ratios?: number[];
   caption?: string;
   id?: string;
 }
 import { withBase } from '../utils/url';
-const { src, images, alt = '', cols, caption, id } = Astro.props;
+const { src, images, alt = '', cols, ratios, caption, id } = Astro.props;
 const list: Img[] = images ?? (src ? [{ src }] : []);
 const n = cols ?? Math.min(list.length, 4);
+const grid = ratios && ratios.length === list.length
+  ? ratios.map((r) => `${r}fr`).join(' ')
+  : null;
+const style = grid
+  ? `--cols:${n};--grid:${grid};--grid-m:${grid}`
+  : `--cols:${n}`;
 ---
 
 <figure class="imgfig" id={id}>
-  <div class="imggrid" style={`--cols:${n}`}>
+  <div class="imggrid" style={style}>
     {list.map((im) => (
       <div class="imgcell">
         <img src={withBase(im.src)} alt={alt} loading="lazy" />
@@ -39,8 +47,10 @@ const n = cols ?? Math.min(list.length, 4);
 <style>
   .imgfig { margin: 1.8em 0; }
   .imggrid {
+    --grid: repeat(var(--cols), 1fr);
+    --grid-m: repeat(2, 1fr);
     display: grid;
-    grid-template-columns: repeat(var(--cols), 1fr);
+    grid-template-columns: var(--grid);
     gap: 10px;
     align-items: start;
   }
@@ -64,6 +74,6 @@ const n = cols ?? Math.min(list.length, 4);
     text-align: left;
   }
   @media (max-width: 640px) {
-    .imggrid { grid-template-columns: repeat(2, 1fr); }
+    .imggrid { grid-template-columns: var(--grid-m); }
   }
 </style>
